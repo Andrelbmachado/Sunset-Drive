@@ -1,0 +1,11 @@
+node_modules/
+dist/
+output/
+cleaned-*.png
+design-*.png
+focused-*.png
+implementation-*.png
+qa-*.png
+wheels-spinning.png
+*.zip
+.DS_Store
