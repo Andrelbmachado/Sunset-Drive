@@ -450,6 +450,10 @@ function createCar() {
 
 const ROAD_HALF_WIDTH = 7.4;
 const ROAD_LENGTH = 420;
+// Five cells across the 14.8-wide road, and rungs at the same pitch along it,
+// so the neon grid reads as squares.
+const GRID_COLUMNS = 5;
+const GRID_CELL = (ROAD_HALF_WIDTH * 2) / GRID_COLUMNS;
 // World units travelled per km/h per second. Sets how fast the track rushes
 // past for a given speedometer reading.
 const WORLD_SCALE = 0.22;
@@ -591,55 +595,82 @@ function createScenery(scene) {
   return { items };
 }
 
-function createDashTexture(color) {
+// Cross-section of a neon grid line: an over-exposed core that falls off into
+// the line's own colour and then to nothing. Offsets are measured across the
+// line, 0.5 being its centre.
+function neonLineStops(hex) {
+  const css = `#${new THREE.Color(hex).getHexString()}`;
+  // The flat transparent stops matter: without them the ramp would spread the
+  // glow across the whole cell instead of hugging the line.
+  return [
+    [0, `${css}00`], [0.36, `${css}00`], [0.43, css], [0.483, '#ffe4f4'],
+    [0.517, '#ffe4f4'], [0.57, css], [0.64, `${css}00`], [1, `${css}00`],
+  ];
+}
+
+// `seam` lays the profile along the tile's length with the core split across
+// the wrap, so a repeating tile draws one rung per cell. Otherwise the profile
+// runs across the tile and paints a single rail.
+function createNeonLineTexture(hex, { seam = false } = {}) {
   const canvas = document.createElement('canvas');
-  canvas.width = 32;
-  canvas.height = 128;
+  canvas.width = seam ? 4 : 128;
+  canvas.height = seam ? 256 : 4;
   const ctx = canvas.getContext('2d');
-  ctx.fillStyle = color;
-  ctx.shadowColor = color;
-  ctx.shadowBlur = 16;
-  ctx.fillRect(6, 0, 20, 68);
+  const gradient = seam
+    ? ctx.createLinearGradient(0, 0, 0, canvas.height)
+    : ctx.createLinearGradient(0, 0, canvas.width, 0);
+  const stops = seam
+    // Rotate the profile half a tile so its centre lands on the seam. The
+    // gradient then holds the core colour out to both tile ends on its own.
+    ? neonLineStops(hex).map(([at, color]) => [at >= 0.5 ? at - 0.5 : at + 0.5, color]).sort((a, b) => a[0] - b[0])
+    : neonLineStops(hex);
+  stops.forEach(([at, color]) => gradient.addColorStop(at, color));
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
   const texture = new THREE.CanvasTexture(canvas);
   texture.colorSpace = THREE.SRGBColorSpace;
-  texture.wrapS = THREE.RepeatWrapping;
-  texture.wrapT = THREE.RepeatWrapping;
+  texture.wrapS = seam ? THREE.RepeatWrapping : THREE.ClampToEdgeWrapping;
+  texture.wrapT = seam ? THREE.RepeatWrapping : THREE.ClampToEdgeWrapping;
   return texture;
 }
 
 function createRaceWorld(scene, renderer) {
   const loader = new THREE.TextureLoader();
 
-  // The track carries no fill at all: it is a matte dark surface that only the
-  // neon lane markings sit on top of.
+  // The track carries no fill at all: it is a black surface that only the neon
+  // grid sits on top of.
   const road = new THREE.Mesh(
     new THREE.PlaneGeometry(ROAD_HALF_WIDTH * 2, ROAD_LENGTH),
-    new THREE.MeshStandardMaterial({ color: 0x0d0718, roughness: 1, metalness: 0 }),
+    new THREE.MeshStandardMaterial({ color: 0x07030e, roughness: 1, metalness: 0 }),
   );
   road.rotation.x = -Math.PI / 2;
   road.position.set(0, 0, 120);
   road.receiveShadow = true;
   scene.add(road);
 
-  const centerDash = createDashTexture('#ff0d87');
-  centerDash.repeat.set(1, 130);
-  const centerLine = new THREE.Mesh(
-    new THREE.PlaneGeometry(0.32, 420),
-    new THREE.MeshBasicMaterial({ map: centerDash, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false }),
+  // Rungs scroll with the car and rails stay put, so the grid squares stream
+  // toward the camera the way the synthwave reference does. Both directions use
+  // the same pitch, which keeps the cells square. Everything is additive, so
+  // the crossings burn brighter than the lines themselves.
+  const gridTexture = createNeonLineTexture(PINK, { seam: true });
+  gridTexture.repeat.set(1, ROAD_LENGTH / GRID_CELL);
+  gridTexture.anisotropy = Math.min(renderer.capabilities.getMaxAnisotropy(), 8);
+  const rungs = new THREE.Mesh(
+    new THREE.PlaneGeometry(ROAD_HALF_WIDTH * 2, ROAD_LENGTH),
+    new THREE.MeshBasicMaterial({ map: gridTexture, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false }),
   );
-  centerLine.rotation.x = -Math.PI / 2;
-  centerLine.position.set(0, 0.014, 120);
-  scene.add(centerLine);
+  rungs.rotation.x = -Math.PI / 2;
+  rungs.position.set(0, 0.012, 120);
+  scene.add(rungs);
 
-  [-1, 1].forEach((side) => {
-    const edge = new THREE.Mesh(
-      new THREE.PlaneGeometry(0.22, 420),
-      new THREE.MeshBasicMaterial({ color: PINK, transparent: true, opacity: 0.95, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false }),
-    );
-    edge.rotation.x = -Math.PI / 2;
-    edge.position.set(side * ROAD_HALF_WIDTH, 0.014, 120);
-    scene.add(edge);
-  });
+  const railMaterial = new THREE.MeshBasicMaterial({ map: createNeonLineTexture(PINK), transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false });
+  const railGeometry = new THREE.PlaneGeometry(GRID_CELL, ROAD_LENGTH);
+  for (let i = 0; i <= GRID_COLUMNS; i += 1) {
+    const rail = new THREE.Mesh(railGeometry, railMaterial);
+    rail.rotation.x = -Math.PI / 2;
+    rail.position.set(-ROAD_HALF_WIDTH + i * GRID_CELL, 0.014, 120);
+    scene.add(rail);
+  }
 
   const shoulder = new THREE.Mesh(
     new THREE.PlaneGeometry(220, 420),
@@ -668,7 +699,7 @@ function createRaceWorld(scene, renderer) {
   renderer.shadowMap.enabled = true;
   const traffic = createTraffic(scene);
   const scenery = createScenery(scene);
-  return { centerDash, traffic, scenery };
+  return { gridTexture, traffic, scenery };
 }
 
 export function createNeonCarExperience(container, { onReady, onTelemetry }) {
@@ -897,7 +928,7 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     // One shared distance drives the texture scroll, the traffic and the
     // scenery, so the whole world moves at the speed on the dial.
     travelThisFrame = speed * WORLD_SCALE * delta;
-    raceWorld.centerDash.offset.y = (raceWorld.centerDash.offset.y - travelThisFrame * (raceWorld.centerDash.repeat.y / ROAD_LENGTH)) % 1;
+    raceWorld.gridTexture.offset.y = (raceWorld.gridTexture.offset.y - travelThisFrame * (raceWorld.gridTexture.repeat.y / ROAD_LENGTH)) % 1;
     wheelsSpinning = Math.abs(speed) > 0.5;
 
     if (!currentPreset) {
@@ -1179,7 +1210,7 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
       palms: raceWorld.scenery.items.filter((item) => item.span === PALM_SPACING * PALM_PER_SIDE).length,
       buildings: raceWorld.scenery.items.filter((item) => item.span === BUILDING_SPACING * BUILDING_PER_SIDE).length,
     },
-    floorScroll: Number(raceWorld.centerDash.offset.y.toFixed(3)),
+    floorScroll: Number(raceWorld.gridTexture.offset.y.toFixed(3)),
     wheelsSpinning,
     backfire: {
       active: backfireTime > 0,

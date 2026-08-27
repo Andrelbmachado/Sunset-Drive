@@ -24,7 +24,7 @@ Build app UI in `src/`. Keep `.openai/hosting.json`, `worker/index.js`, `scripts
 - Keep wheels 70% wider than the initial design and wheel-arch bands/depth 80% thicker than their initial corrected form.
 - The red underglow belongs on the fixed floor, must extend beyond the outside edges of all tires, and must never rise or fall with the car.
 - Keep the latest compact wheel-arch radius (30% smaller outer radius) as the current visual direction, with the inner edge still outside the tire radius.
-- The track carries no fill pattern: it is a matte dark surface with neon pink markings only. Both edge lines and the centre dash are pink; nothing on the track is blue.
+- The track is a neon pink grid on a near-black surface: scrolling transverse rungs plus fixed longitudinal rails at the same pitch, so the cells are square. No fill pattern, no centre dash, no edge lines, and nothing on the track is blue.
 - No light runs down the centre of the track.
 - Roadside palms use `public/assets/palm.glb` and must stay almost black. Achieve that with lighting (their own dim render layer), never by overwriting the model's material or texture, so the same asset still reads correctly on a brighter terrain.
 - Skyline buildings use `public/assets/building.glb`, sit far out to the sides to read as distant, stretch between 1x and 3x vertically, and alternate tint colours. They are the only scenery the sunset `DirectionalLight` touches.

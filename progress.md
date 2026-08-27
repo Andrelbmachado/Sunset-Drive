@@ -1,5 +1,15 @@
 Original prompt: gere o threejs desse carro, o mais detalhista possivel.
 
+## Neon grid road
+
+- Rebuilt the track as the classic synthwave neon grid from the supplied reference: transverse rungs that scroll with the car plus fixed longitudinal rails, both on the same 2.96-unit pitch so the cells read as squares.
+- Rungs come from a repeating tile whose glow profile straddles the tile seam, so one rung lands per cell and the wrap is invisible. Rails reuse the same profile across a cell-wide plane, which gives both axes an identical line weight.
+- Each line is an over-exposed core falling off into pink and then to nothing. The profile keeps flat transparent stops on either side; without them the gradient ramp spreads across the whole cell and washes the grid out instead of hugging the line.
+- Everything is additive, so crossings burn brighter than the lines, and the road surface underneath is near black.
+- This replaces the centre dash and the two edge lines, which the grid now supersedes. `floorScroll` in the telemetry hook follows the grid texture.
+- Production build and all four Sites tests pass; console is clean.
+- TODO: none for this request.
+
 ## Track visuals, GLB scenery and two-way traffic
 
 - Replaced the palm and building placeholder boxes with the supplied `Palmeira.glb` and `Building.glb`, copied into `public/assets/` as `palm.glb` and `building.glb` and loaded through `GLTFLoader` without blocking startup.
