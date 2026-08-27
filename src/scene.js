@@ -441,6 +441,71 @@ function createCar() {
 }
 
 const ROAD_HALF_WIDTH = 7.4;
+const ROAD_LENGTH = 420;
+// World units travelled per km/h per second. Sets how fast the track rushes
+// past for a given speedometer reading.
+const WORLD_SCALE = 0.22;
+const LANES = [-4.6, -1.55, 1.55, 4.6];
+const TRAFFIC_SPAWN_Z = 210;
+const TRAFFIC_DESPAWN_Z = -28;
+
+function createTraffic(scene) {
+  const group = new THREE.Group();
+  group.name = 'traffic';
+  const geometry = new THREE.BoxGeometry(1.9, 1.3, 4.2);
+  const palette = [0x1de5ff, 0xffb020, 0x9d4bff, 0x28ff9b, 0xff4f7d];
+  const slots = [];
+  for (let i = 0; i < 16; i += 1) {
+    const color = palette[i % palette.length];
+    const mesh = new THREE.Mesh(
+      geometry,
+      new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.45, roughness: 0.5, metalness: 0.2 }),
+    );
+    mesh.castShadow = true;
+    mesh.visible = false;
+    addEdges(mesh, 0xffffff, 0.3, 18);
+    group.add(mesh);
+    slots.push({ mesh, active: false, speed: 0, hit: false });
+  }
+  scene.add(group);
+  return { group, slots };
+}
+
+function createScenery(scene) {
+  const items = [];
+
+  // Placeholder cubes standing in for the palm trees that line the road.
+  const palmGeometry = new THREE.BoxGeometry(0.8, 5.4, 0.8);
+  const palmMaterial = new THREE.MeshStandardMaterial({ color: 0x11402f, emissive: 0x0b2a1f, emissiveIntensity: 0.6, roughness: 0.85, metalness: 0 });
+  const palmSpacing = 17.5;
+  const palmPerSide = 26;
+  const palmSpan = palmSpacing * palmPerSide;
+  for (let i = 0; i < palmPerSide * 2; i += 1) {
+    const side = i % 2 ? 1 : -1;
+    const mesh = new THREE.Mesh(palmGeometry, palmMaterial);
+    mesh.position.set(side * 9.4, 2.7, Math.floor(i / 2) * palmSpacing - 40);
+    mesh.castShadow = true;
+    scene.add(mesh);
+    items.push({ mesh, span: palmSpan });
+  }
+
+  // Dark grey blocks standing in for the skyline buildings further out.
+  const buildingMaterial = new THREE.MeshStandardMaterial({ color: 0x1c1c24, roughness: 0.95, metalness: 0 });
+  const buildingSpacing = 31;
+  const buildingPerSide = 20;
+  const buildingSpan = buildingSpacing * buildingPerSide;
+  for (let i = 0; i < buildingPerSide * 2; i += 1) {
+    const side = i % 2 ? 1 : -1;
+    const height = 9 + ((i * 7) % 5) * 4.6;
+    const width = 5 + ((i * 3) % 4) * 2.2;
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(width, height, width * 0.9), buildingMaterial);
+    mesh.position.set(side * (23 + ((i * 5) % 3) * 7.5), height / 2, Math.floor(i / 2) * buildingSpacing - 40);
+    scene.add(mesh);
+    items.push({ mesh, span: buildingSpan });
+  }
+
+  return { items };
+}
 
 function createCheckerFloorTexture() {
   const size = 256;
@@ -497,11 +562,12 @@ function createDashTexture(color) {
 function createRaceWorld(scene, renderer) {
   const loader = new THREE.TextureLoader();
   const floorTexture = createCheckerFloorTexture();
-  floorTexture.repeat.set(9, 90);
+  // Square cells: 5 repeats across the 14.8-wide road, 142 along its length.
+  floorTexture.repeat.set(5, 142);
   floorTexture.anisotropy = Math.min(renderer.capabilities.getMaxAnisotropy(), 8);
 
   const road = new THREE.Mesh(
-    new THREE.PlaneGeometry(ROAD_HALF_WIDTH * 2, 420),
+    new THREE.PlaneGeometry(ROAD_HALF_WIDTH * 2, ROAD_LENGTH),
     new THREE.MeshStandardMaterial({ map: floorTexture, emissiveMap: floorTexture, emissive: 0x3d0f36, emissiveIntensity: 0.6, roughness: 1, metalness: 0 }),
   );
   road.rotation.x = -Math.PI / 2;
@@ -554,7 +620,9 @@ function createRaceWorld(scene, renderer) {
   scene.add(horizonGlow);
 
   renderer.shadowMap.enabled = true;
-  return { floorTexture, centerDash };
+  const traffic = createTraffic(scene);
+  const scenery = createScenery(scene);
+  return { floorTexture, centerDash, traffic, scenery };
 }
 
 export function createNeonCarExperience(container, { onReady, onTelemetry }) {
@@ -653,6 +721,16 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   let launchTimer = 0;
   let prevAccelerating = false;
   let bodyPitch = 0;
+  let travelThisFrame = 0;
+  let raceTime = 0;
+  let spawnTimer = 0;
+  let impactFlash = 0;
+  let collisions = 0;
+  const DIFFICULTY_RAMP = 90;
+  const CAMERA_Z = -10.4;
+  const TARGET_Z = 5.2;
+  let cameraHeight = 3.15;
+  let cameraAngle = 8;
   let activeTurnSignal = null;
   let turnSignalTime = 0;
   const suspension = {
@@ -744,9 +822,11 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
       if (index < 2) wheel.rotation.y = THREE.MathUtils.lerp(wheel.rotation.y, -steer * 0.32, 1 - Math.exp(-9 * delta));
     });
 
-    const scroll = speed * delta * 0.0035;
-    raceWorld.floorTexture.offset.y = (raceWorld.floorTexture.offset.y - scroll) % 1;
-    raceWorld.centerDash.offset.y = (raceWorld.centerDash.offset.y - scroll * (raceWorld.centerDash.repeat.y / raceWorld.floorTexture.repeat.y)) % 1;
+    // One shared distance drives the texture scroll, the traffic and the
+    // scenery, so the whole world moves at the speed on the dial.
+    travelThisFrame = speed * WORLD_SCALE * delta;
+    raceWorld.floorTexture.offset.y = (raceWorld.floorTexture.offset.y - travelThisFrame * (raceWorld.floorTexture.repeat.y / ROAD_LENGTH)) % 1;
+    raceWorld.centerDash.offset.y = (raceWorld.centerDash.offset.y - travelThisFrame * (raceWorld.centerDash.repeat.y / ROAD_LENGTH)) % 1;
     wheelsSpinning = Math.abs(speed) > 0.5;
 
     if (!currentPreset) {
@@ -835,10 +915,101 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     });
   }
 
+  function difficulty() {
+    return THREE.MathUtils.clamp(raceTime / DIFFICULTY_RAMP, 0, 1);
+  }
+
+  function spawnTrafficCar() {
+    const slot = raceWorld.traffic.slots.find((entry) => !entry.active);
+    if (!slot) return;
+    const level = difficulty();
+    const lane = LANES[Math.floor(Math.random() * LANES.length)];
+    slot.active = true;
+    slot.hit = false;
+    // Faster traffic later on leaves less room to weave through.
+    slot.speed = THREE.MathUtils.lerp(70, 150, level) + Math.random() * 25;
+    slot.mesh.visible = true;
+    slot.mesh.position.set(lane, 0.68, TRAFFIC_SPAWN_Z + Math.random() * 40);
+    slot.mesh.material.emissiveIntensity = 0.45;
+  }
+
+  function updateTraffic(delta) {
+    const { slots } = raceWorld.traffic;
+    if (!raceRunning) {
+      slots.forEach((slot) => { slot.active = false; slot.mesh.visible = false; });
+      raceTime = 0;
+      spawnTimer = 0;
+      collisions = 0;
+      return;
+    }
+
+    raceTime += delta;
+    const level = difficulty();
+    const activeCount = slots.reduce((total, slot) => total + (slot.active ? 1 : 0), 0);
+    const maxActive = Math.round(THREE.MathUtils.lerp(2, 9, level));
+    spawnTimer -= delta;
+    if (spawnTimer <= 0 && activeCount < maxActive) {
+      spawnTrafficCar();
+      spawnTimer = THREE.MathUtils.lerp(2.8, 0.75, level) * (0.7 + Math.random() * 0.6);
+    }
+
+    slots.forEach((slot) => {
+      if (!slot.active) return;
+      // Traffic drifts toward the camera at the closing speed between us.
+      slot.mesh.position.z -= (speed - slot.speed) * WORLD_SCALE * delta;
+      if (slot.mesh.position.z < TRAFFIC_DESPAWN_Z || slot.mesh.position.z > TRAFFIC_SPAWN_Z + 90) {
+        slot.active = false;
+        slot.mesh.visible = false;
+        return;
+      }
+      if (slot.hit) {
+        slot.mesh.material.emissiveIntensity = Math.max(0.45, slot.mesh.material.emissiveIntensity - delta * 4);
+        return;
+      }
+      const dx = Math.abs(slot.mesh.position.x - carX);
+      const dz = Math.abs(slot.mesh.position.z);
+      if (dx < 2.4 && dz < 5.8) {
+        slot.hit = true;
+        collisions += 1;
+        slot.mesh.material.emissiveIntensity = 3.2;
+        speed *= 0.45;
+        gearIndex = gearForSpeed(Math.abs(speed));
+        torque = 0;
+        impactFlash = 0.45;
+        suspension.phase = 'spring';
+        suspension.springTime = 0;
+        suspension.amplitude = 0.14;
+      }
+    });
+  }
+
+  function updateScenery() {
+    raceWorld.scenery.items.forEach((item) => {
+      item.mesh.position.z -= travelThisFrame;
+      if (item.mesh.position.z < -45) item.mesh.position.z += item.span;
+      else if (item.mesh.position.z > item.span - 45) item.mesh.position.z -= item.span;
+    });
+  }
+
+  function updateCameraRig(delta) {
+    if (currentPreset) return;
+    camera.position.y = THREE.MathUtils.lerp(camera.position.y, cameraHeight, 1 - Math.exp(-8 * delta));
+    const targetY = cameraHeight - Math.tan(THREE.MathUtils.degToRad(cameraAngle)) * (TARGET_Z - CAMERA_Z);
+    controls.target.y = THREE.MathUtils.lerp(controls.target.y, targetY, 1 - Math.exp(-8 * delta));
+  }
+
   function update(delta, elapsed, maxed) {
     updateBackfire(delta, elapsed, maxed);
     updateTurnSignals(delta);
     updateSuspension(delta);
+    updateTraffic(delta);
+    updateScenery();
+    updateCameraRig(delta);
+    if (impactFlash > 0) {
+      impactFlash = Math.max(0, impactFlash - delta);
+      bodyPitch += impactFlash * 0.08;
+      model.car.rotation.x = bodyPitch;
+    }
   }
 
   function animate() {
@@ -884,8 +1055,15 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
       torque: Number(torque.toFixed(2)),
       gear: gearIndex + 1,
       shifting: shiftTimer > 0,
-      floorScroll: Number(raceWorld.floorTexture.offset.y.toFixed(3)),
+      travelPerSecond: Number((speed * WORLD_SCALE).toFixed(1)),
     },
+    traffic: {
+      active: raceWorld.traffic.slots.filter((slot) => slot.active).length,
+      maxActive: Math.round(THREE.MathUtils.lerp(2, 9, THREE.MathUtils.clamp(raceTime / DIFFICULTY_RAMP, 0, 1))),
+      raceTime: Number(raceTime.toFixed(1)),
+      collisions,
+    },
+    floorScroll: Number(raceWorld.floorTexture.offset.y.toFixed(3)),
     wheelsSpinning,
     backfire: {
       active: backfireTime > 0,
@@ -920,6 +1098,11 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
 
   return {
     setRunning(enabled) { raceRunning = enabled; },
+    setCameraRig({ height, angle }) {
+      if (typeof height === 'number') cameraHeight = THREE.MathUtils.clamp(height, 1.4, 9);
+      if (typeof angle === 'number') cameraAngle = THREE.MathUtils.clamp(angle, -2, 30);
+    },
+    getCameraRig() { return { height: cameraHeight, angle: cameraAngle }; },
     setCamera(name) {
       const preset = cameraPresets[name];
       if (!preset) return;
