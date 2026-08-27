@@ -438,23 +438,94 @@ function createCar() {
   return { car, wheels, lightMeshes, backfire, indicators, underGlow };
 }
 
+const ROAD_HALF_WIDTH = 7.4;
+
+function createCheckerFloorTexture() {
+  const size = 256;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  const cell = size / 2;
+  const colors = ['#050212', '#3d1362'];
+  for (let y = 0; y < 2; y += 1) {
+    for (let x = 0; x < 2; x += 1) {
+      ctx.fillStyle = colors[(x + y) % 2];
+      ctx.fillRect(x * cell, y * cell, cell, cell);
+    }
+  }
+  ctx.strokeStyle = '#ff1f9b';
+  ctx.lineWidth = 5;
+  ctx.shadowColor = '#ff1f9b';
+  ctx.shadowBlur = 18;
+  ctx.beginPath();
+  ctx.moveTo(0, cell + 0.5);
+  ctx.lineTo(size, cell + 0.5);
+  ctx.moveTo(cell + 0.5, 0);
+  ctx.lineTo(cell + 0.5, size);
+  ctx.stroke();
+  ctx.strokeStyle = '#37b8ff';
+  ctx.lineWidth = 2;
+  ctx.shadowBlur = 10;
+  ctx.shadowColor = '#37b8ff';
+  ctx.strokeRect(1, 1, size - 2, size - 2);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.wrapS = THREE.RepeatWrapping;
+  texture.wrapT = THREE.RepeatWrapping;
+  return texture;
+}
+
+function createDashTexture(color) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 32;
+  canvas.height = 128;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = color;
+  ctx.shadowColor = color;
+  ctx.shadowBlur = 16;
+  ctx.fillRect(6, 0, 20, 68);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.wrapS = THREE.RepeatWrapping;
+  texture.wrapT = THREE.RepeatWrapping;
+  return texture;
+}
+
 function createRaceWorld(scene, renderer) {
   const loader = new THREE.TextureLoader();
-  const floorTexture = loader.load(`${ASSET_BASE}assets/neon-grid-floor.png`);
-  floorTexture.colorSpace = THREE.SRGBColorSpace;
-  floorTexture.wrapS = THREE.RepeatWrapping;
-  floorTexture.wrapT = THREE.RepeatWrapping;
-  floorTexture.repeat.set(6, 70);
+  const floorTexture = createCheckerFloorTexture();
+  floorTexture.repeat.set(9, 90);
   floorTexture.anisotropy = Math.min(renderer.capabilities.getMaxAnisotropy(), 8);
 
   const road = new THREE.Mesh(
-    new THREE.PlaneGeometry(34, 420),
-    new THREE.MeshStandardMaterial({ map: floorTexture, emissiveMap: floorTexture, emissive: 0x421037, emissiveIntensity: 0.72, roughness: 0.42, metalness: 0.28 }),
+    new THREE.PlaneGeometry(ROAD_HALF_WIDTH * 2, 420),
+    new THREE.MeshStandardMaterial({ map: floorTexture, emissiveMap: floorTexture, emissive: 0x3d0f36, emissiveIntensity: 0.85, roughness: 0.38, metalness: 0.32 }),
   );
   road.rotation.x = -Math.PI / 2;
   road.position.set(0, 0, 120);
   road.receiveShadow = true;
   scene.add(road);
+
+  const centerDash = createDashTexture('#ffe6f7');
+  centerDash.repeat.set(1, 130);
+  const centerLine = new THREE.Mesh(
+    new THREE.PlaneGeometry(0.32, 420),
+    new THREE.MeshBasicMaterial({ map: centerDash, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false }),
+  );
+  centerLine.rotation.x = -Math.PI / 2;
+  centerLine.position.set(0, 0.014, 120);
+  scene.add(centerLine);
+
+  [-1, 1].forEach((side) => {
+    const edge = new THREE.Mesh(
+      new THREE.PlaneGeometry(0.22, 420),
+      new THREE.MeshBasicMaterial({ color: 0x20e4ff, transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false }),
+    );
+    edge.rotation.x = -Math.PI / 2;
+    edge.position.set(side * ROAD_HALF_WIDTH, 0.014, 120);
+    scene.add(edge);
+  });
 
   const shoulder = new THREE.Mesh(
     new THREE.PlaneGeometry(72, 420),
@@ -481,7 +552,7 @@ function createRaceWorld(scene, renderer) {
   scene.add(horizonGlow);
 
   renderer.shadowMap.enabled = true;
-  return { floorTexture };
+  return { floorTexture, centerDash };
 }
 
 export function createNeonCarExperience(container, { onReady, onTelemetry }) {
@@ -550,8 +621,18 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   let raceRunning = false;
   let speed = 0;
   let steer = 0;
+  let carX = 0;
+  let torque = 0;
   let lastTelemetryAt = 0;
   const keys = new Set();
+  const ACCEL = 130;
+  const BRAKE_DECEL = 200 / 3.5;
+  const REVERSE_ACCEL = 55;
+  const COAST_DECEL = 22;
+  const MAX_SPEED = 220;
+  const MAX_REVERSE = -55;
+  const LATERAL_SPEED = 9.5;
+  const CAR_HALF_WIDTH = 1.45;
   let activeTurnSignal = null;
   let turnSignalTime = 0;
   const suspension = {
@@ -576,49 +657,73 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     const braking = keys.has('ArrowDown') || keys.has('KeyS');
     const steeringLeft = keys.has('ArrowLeft') || keys.has('KeyA');
     const steeringRight = keys.has('ArrowRight') || keys.has('KeyD');
+
     if (raceRunning) {
-      if (accelerating) speed += 72 * delta;
-      else speed -= 12 * delta;
-      if (braking) speed -= 105 * delta;
+      if (accelerating && !braking) {
+        speed += ACCEL * delta;
+        torque = THREE.MathUtils.lerp(torque, 1, 1 - Math.exp(-6 * delta));
+      } else if (braking) {
+        speed -= (speed > 0.05 ? BRAKE_DECEL : -REVERSE_ACCEL) * delta;
+        torque = THREE.MathUtils.lerp(torque, 0.3, 1 - Math.exp(-8 * delta));
+      } else {
+        const coast = Math.sign(speed) * COAST_DECEL * delta;
+        speed = Math.abs(coast) >= Math.abs(speed) ? 0 : speed - coast;
+        torque = THREE.MathUtils.lerp(torque, 0, 1 - Math.exp(-5 * delta));
+      }
     } else {
-      speed -= 36 * delta;
+      speed = THREE.MathUtils.lerp(speed, 0, 1 - Math.exp(-3 * delta));
+      torque = THREE.MathUtils.lerp(torque, 0, 1 - Math.exp(-5 * delta));
     }
-    speed = THREE.MathUtils.clamp(speed, 0, 220);
+    speed = THREE.MathUtils.clamp(speed, MAX_REVERSE, MAX_SPEED);
+
     const steerTarget = steeringLeft ? -1 : steeringRight ? 1 : 0;
     steer = THREE.MathUtils.lerp(steer, steerTarget, 1 - Math.exp(-8 * delta));
+    const steerAuthority = THREE.MathUtils.clamp(Math.abs(speed) / 26, 0.22, 1);
+    carX += steer * LATERAL_SPEED * steerAuthority * delta;
+    carX = THREE.MathUtils.clamp(carX, -(ROAD_HALF_WIDTH - CAR_HALF_WIDTH), ROAD_HALF_WIDTH - CAR_HALF_WIDTH);
+    model.car.position.x = carX;
     model.car.rotation.z = THREE.MathUtils.lerp(model.car.rotation.z, -steer * 0.035, 1 - Math.exp(-6 * delta));
-    model.car.rotation.y = THREE.MathUtils.lerp(model.car.rotation.y, steer * 0.022, 1 - Math.exp(-5 * delta));
+    model.car.rotation.y = THREE.MathUtils.lerp(model.car.rotation.y, steer * 0.06, 1 - Math.exp(-5 * delta));
     wheelAngle -= delta * (speed * 0.11);
     model.wheels.forEach((wheel) => { wheel.rotation.x = wheelAngle; });
-    raceWorld.floorTexture.offset.y = (raceWorld.floorTexture.offset.y - speed * delta * 0.0035) % 1;
-    wheelsSpinning = speed > 0.5;
+
+    const scroll = speed * delta * 0.0035;
+    raceWorld.floorTexture.offset.y = (raceWorld.floorTexture.offset.y - scroll) % 1;
+    raceWorld.centerDash.offset.y = (raceWorld.centerDash.offset.y - scroll * (raceWorld.centerDash.repeat.y / raceWorld.floorTexture.repeat.y)) % 1;
+    wheelsSpinning = Math.abs(speed) > 0.5;
+
+    if (!currentPreset) {
+      camera.position.x = THREE.MathUtils.lerp(camera.position.x, carX, 1 - Math.exp(-4 * delta));
+      controls.target.x = THREE.MathUtils.lerp(controls.target.x, carX, 1 - Math.exp(-4 * delta));
+    }
+
     if (onTelemetry && elapsed - lastTelemetryAt > 0.11) {
       lastTelemetryAt = elapsed;
-      const gear = speed < 1 ? 'N' : speed < 55 ? '1' : speed < 95 ? '2' : speed < 140 ? '3' : speed < 180 ? '4' : '5';
-      onTelemetry({ speed, rpm: speed < 1 ? 0 : 1150 + speed * 31, gear });
+      const absSpeed = Math.abs(speed);
+      const gear = speed < -0.5 ? 'R' : absSpeed < 1 ? 'N' : absSpeed < 55 ? '1' : absSpeed < 95 ? '2' : absSpeed < 140 ? '3' : absSpeed < 180 ? '4' : '5';
+      onTelemetry({ speed: absSpeed, rpm: absSpeed < 1 ? 0 : 1150 + absSpeed * 31, gear, torque });
     }
   }
 
-  function updateBackfire(delta) {
-    if (backfireTime <= 0) {
-      model.backfire.group.visible = false;
-      return;
-    }
+  let flameEnvelope = 0;
+  function updateBackfire(delta, elapsed, maxed) {
     backfireTime = Math.max(0, backfireTime - delta);
-    const progress = 1 - backfireTime / backfireDuration;
-    const envelope = Math.sin(Math.min(progress * Math.PI, Math.PI));
-    model.backfire.group.visible = true;
+    const pulse = backfireTime > 0 ? Math.sin(Math.min((1 - backfireTime / backfireDuration) * Math.PI, Math.PI)) : 0;
+    flameEnvelope = THREE.MathUtils.lerp(flameEnvelope, maxed ? 1 : 0, 1 - Math.exp(-7 * delta));
+    const envelope = Math.max(pulse, flameEnvelope);
+    model.backfire.group.visible = envelope > 0.01;
+    if (envelope <= 0.01) return;
     model.backfire.flames.forEach((flame, index) => {
-      const pulse = 0.72 + Math.sin(progress * 42 + index * 1.7) * 0.28;
+      const flicker = 0.72 + Math.sin(elapsed * 34 + index * 1.7) * 0.28;
       flame.material.opacity = envelope * (index % 2 ? 0.95 : 0.72);
-      flame.scale.set(0.75 + pulse * 0.5, 0.35 + envelope * pulse * 1.15, 0.75 + pulse * 0.5);
+      flame.scale.set(0.75 + flicker * 0.5, 0.35 + envelope * flicker * 1.15, 0.75 + flicker * 0.5);
     });
+    const sparkProgress = backfireTime > 0 ? Math.min(1, (1 - backfireTime / backfireDuration) * 1.45) : (elapsed % 0.4) / 0.4;
     model.backfire.sparks.forEach((spark, index) => {
-      const sparkProgress = Math.min(1, progress * 1.45);
       spark.position.copy(spark.userData.origin).addScaledVector(spark.userData.velocity, sparkProgress);
       spark.position.y -= sparkProgress * sparkProgress * 0.14;
-      spark.material.opacity = Math.max(0, (1 - sparkProgress) * 1.4);
-      spark.scale.setScalar(1 + index % 3 * 0.35);
+      spark.material.opacity = Math.max(0, (1 - sparkProgress) * 1.4 * envelope);
+      spark.scale.setScalar(1 + (index % 3) * 0.35);
     });
     model.backfire.light.intensity = envelope * 38;
   }
@@ -667,8 +772,8 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     });
   }
 
-  function update(delta) {
-    updateBackfire(delta);
+  function update(delta, elapsed, maxed) {
+    updateBackfire(delta, elapsed, maxed);
     updateTurnSignals(delta);
     updateSuspension(delta);
   }
@@ -685,7 +790,8 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
       if (t >= 1) currentPreset = null;
     }
     updateDriving(delta, elapsed);
-    update(delta);
+    const maxed = raceRunning && torque > 0.92 && speed > MAX_SPEED - 8;
+    update(delta, elapsed, maxed);
     const glowPulse = lightsEnabled ? 2.7 + Math.sin(elapsed * 2.2) * 0.18 : 0;
     model.lightMeshes.forEach((lens) => { lens.material.emissiveIntensity = glowPulse; });
     controls.update();
@@ -711,6 +817,8 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
       running: raceRunning,
       speed: Number(speed.toFixed(1)),
       steer: Number(steer.toFixed(2)),
+      carX: Number(carX.toFixed(2)),
+      torque: Number(torque.toFixed(2)),
       floorScroll: Number(raceWorld.floorTexture.offset.y.toFixed(3)),
     },
     wheelsSpinning,
@@ -736,8 +844,10 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   window.advanceTime = (ms) => {
     const steps = Math.max(1, Math.round(ms / (1000 / 60)));
     for (let i = 0; i < steps; i += 1) {
-      updateDriving(1 / 60, clock.elapsedTime + i / 60);
-      update(1 / 60);
+      const stepElapsed = clock.elapsedTime + i / 60;
+      updateDriving(1 / 60, stepElapsed);
+      const maxed = raceRunning && torque > 0.92 && speed > MAX_SPEED - 8;
+      update(1 / 60, stepElapsed, maxed);
     }
     controls.update();
     composer.render();
