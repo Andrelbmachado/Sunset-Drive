@@ -351,6 +351,8 @@ function createCar() {
   [2.28, -2.27].forEach((z) => {
     [-1, 1].forEach((side) => {
       const wheel = createWheel(side, z, materials);
+      // Front wheels steer, so yaw must be applied before the rolling spin.
+      if (z > 0) wheel.rotation.order = 'YXZ';
       car.add(wheel);
       wheels.push(wheel);
       const wheelArch = createWheelArch(side, z, materials);
@@ -500,7 +502,7 @@ function createRaceWorld(scene, renderer) {
 
   const road = new THREE.Mesh(
     new THREE.PlaneGeometry(ROAD_HALF_WIDTH * 2, 420),
-    new THREE.MeshStandardMaterial({ map: floorTexture, emissiveMap: floorTexture, emissive: 0x3d0f36, emissiveIntensity: 0.85, roughness: 0.38, metalness: 0.32 }),
+    new THREE.MeshStandardMaterial({ map: floorTexture, emissiveMap: floorTexture, emissive: 0x3d0f36, emissiveIntensity: 0.6, roughness: 1, metalness: 0 }),
   );
   road.rotation.x = -Math.PI / 2;
   road.position.set(0, 0, 120);
@@ -625,14 +627,32 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   let torque = 0;
   let lastTelemetryAt = 0;
   const keys = new Set();
-  const ACCEL = 130;
-  const BRAKE_DECEL = 200 / 3.5;
-  const REVERSE_ACCEL = 55;
-  const COAST_DECEL = 22;
   const MAX_SPEED = 220;
   const MAX_REVERSE = -55;
+  // Five gears, each covering its own speed band in roughly GEAR_SECONDS of
+  // throttle, so a full pull from a standstill to MAX_SPEED takes ~20 s.
+  const GEARS = [
+    { min: 0, max: 55 },
+    { min: 55, max: 100 },
+    { min: 100, max: 140 },
+    { min: 140, max: 180 },
+    { min: 180, max: MAX_SPEED },
+  ];
+  const GEAR_SECONDS = 4;
+  const SHIFT_SECONDS = 0.42;
+  const SHIFT_SPEED_LOSS = 9;
+  const LAUNCH_SECONDS = 0.55;
+  const LAUNCH_BOOST = 58;
+  const COAST_DECEL = MAX_SPEED / 2;
+  const BRAKE_DECEL = 160;
+  const REVERSE_ACCEL = 55;
   const LATERAL_SPEED = 9.5;
   const CAR_HALF_WIDTH = 1.45;
+  let gearIndex = 0;
+  let shiftTimer = 0;
+  let launchTimer = 0;
+  let prevAccelerating = false;
+  let bodyPitch = 0;
   let activeTurnSignal = null;
   let turnSignalTime = 0;
   const suspension = {
@@ -652,40 +672,77 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   window.addEventListener('keydown', onKeyDown);
   window.addEventListener('keyup', onKeyUp);
 
+  function gearForSpeed(value) {
+    for (let i = GEARS.length - 1; i >= 0; i -= 1) if (value >= GEARS[i].min) return i;
+    return 0;
+  }
+
   function updateDriving(delta, elapsed) {
     const accelerating = keys.has('ArrowUp') || keys.has('KeyW');
     const braking = keys.has('ArrowDown') || keys.has('KeyS');
     const steeringLeft = keys.has('ArrowLeft') || keys.has('KeyA');
     const steeringRight = keys.has('ArrowRight') || keys.has('KeyD');
+    let pitchTarget = 0;
 
-    if (raceRunning) {
-      if (accelerating && !braking) {
-        speed += ACCEL * delta;
-        torque = THREE.MathUtils.lerp(torque, 1, 1 - Math.exp(-6 * delta));
-      } else if (braking) {
-        speed -= (speed > 0.05 ? BRAKE_DECEL : -REVERSE_ACCEL) * delta;
-        torque = THREE.MathUtils.lerp(torque, 0.3, 1 - Math.exp(-8 * delta));
-      } else {
-        const coast = Math.sign(speed) * COAST_DECEL * delta;
-        speed = Math.abs(coast) >= Math.abs(speed) ? 0 : speed - coast;
-        torque = THREE.MathUtils.lerp(torque, 0, 1 - Math.exp(-5 * delta));
-      }
-    } else {
+    if (!raceRunning) {
       speed = THREE.MathUtils.lerp(speed, 0, 1 - Math.exp(-3 * delta));
       torque = THREE.MathUtils.lerp(torque, 0, 1 - Math.exp(-5 * delta));
+      gearIndex = 0;
+      shiftTimer = 0;
+      launchTimer = 0;
+    } else if (shiftTimer > 0) {
+      // Mid-shift: the clutch is out, so speed bleeds off and torque collapses.
+      shiftTimer = Math.max(0, shiftTimer - delta);
+      speed -= (SHIFT_SPEED_LOSS / SHIFT_SECONDS) * delta;
+      torque = THREE.MathUtils.lerp(torque, 0.04, 1 - Math.exp(-16 * delta));
+      pitchTarget = 0.035 * (shiftTimer / SHIFT_SECONDS);
+    } else if (accelerating && !braking) {
+      if (!prevAccelerating && speed < 30) {
+        launchTimer = LAUNCH_SECONDS;
+        backfireTime = backfireDuration;
+      }
+      const gear = GEARS[gearIndex];
+      const boost = launchTimer > 0 ? LAUNCH_BOOST * (launchTimer / LAUNCH_SECONDS) : 0;
+      speed += ((gear.max - gear.min) / GEAR_SECONDS + boost) * delta;
+      if (launchTimer > 0) {
+        pitchTarget = -0.055 * (launchTimer / LAUNCH_SECONDS);
+        launchTimer = Math.max(0, launchTimer - delta);
+      }
+      torque = THREE.MathUtils.clamp((speed - gear.min) / (gear.max - gear.min), 0, 1);
+      if (torque >= 1 && gearIndex < GEARS.length - 1) {
+        gearIndex += 1;
+        shiftTimer = SHIFT_SECONDS;
+      }
+    } else if (braking) {
+      speed -= (speed > 0.05 ? BRAKE_DECEL : -REVERSE_ACCEL) * delta;
+      torque = THREE.MathUtils.lerp(torque, 0.2, 1 - Math.exp(-10 * delta));
+      gearIndex = gearForSpeed(Math.abs(speed));
+    } else {
+      const drop = COAST_DECEL * delta;
+      speed = drop >= Math.abs(speed) ? 0 : speed - Math.sign(speed) * drop;
+      torque = THREE.MathUtils.lerp(torque, 0, 1 - Math.exp(-9 * delta));
+      gearIndex = gearForSpeed(Math.abs(speed));
     }
+    prevAccelerating = accelerating;
     speed = THREE.MathUtils.clamp(speed, MAX_REVERSE, MAX_SPEED);
+    bodyPitch = THREE.MathUtils.lerp(bodyPitch, pitchTarget, 1 - Math.exp(-12 * delta));
+    model.car.rotation.x = bodyPitch;
 
+    // Screen-right is world -x from the chase camera, so lateral motion and the
+    // nose yaw both invert the raw steer input.
     const steerTarget = steeringLeft ? -1 : steeringRight ? 1 : 0;
     steer = THREE.MathUtils.lerp(steer, steerTarget, 1 - Math.exp(-8 * delta));
     const steerAuthority = THREE.MathUtils.clamp(Math.abs(speed) / 26, 0.22, 1);
-    carX += steer * LATERAL_SPEED * steerAuthority * delta;
+    carX -= steer * LATERAL_SPEED * steerAuthority * delta;
     carX = THREE.MathUtils.clamp(carX, -(ROAD_HALF_WIDTH - CAR_HALF_WIDTH), ROAD_HALF_WIDTH - CAR_HALF_WIDTH);
     model.car.position.x = carX;
-    model.car.rotation.z = THREE.MathUtils.lerp(model.car.rotation.z, -steer * 0.035, 1 - Math.exp(-6 * delta));
-    model.car.rotation.y = THREE.MathUtils.lerp(model.car.rotation.y, steer * 0.06, 1 - Math.exp(-5 * delta));
+    model.car.rotation.z = THREE.MathUtils.lerp(model.car.rotation.z, -steer * 0.045, 1 - Math.exp(-6 * delta));
+    model.car.rotation.y = THREE.MathUtils.lerp(model.car.rotation.y, -steer * 0.16, 1 - Math.exp(-5 * delta));
     wheelAngle -= delta * (speed * 0.11);
-    model.wheels.forEach((wheel) => { wheel.rotation.x = wheelAngle; });
+    model.wheels.forEach((wheel, index) => {
+      wheel.rotation.x = wheelAngle;
+      if (index < 2) wheel.rotation.y = THREE.MathUtils.lerp(wheel.rotation.y, -steer * 0.32, 1 - Math.exp(-9 * delta));
+    });
 
     const scroll = speed * delta * 0.0035;
     raceWorld.floorTexture.offset.y = (raceWorld.floorTexture.offset.y - scroll) % 1;
@@ -700,8 +757,14 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     if (onTelemetry && elapsed - lastTelemetryAt > 0.11) {
       lastTelemetryAt = elapsed;
       const absSpeed = Math.abs(speed);
-      const gear = speed < -0.5 ? 'R' : absSpeed < 1 ? 'N' : absSpeed < 55 ? '1' : absSpeed < 95 ? '2' : absSpeed < 140 ? '3' : absSpeed < 180 ? '4' : '5';
-      onTelemetry({ speed: absSpeed, rpm: absSpeed < 1 ? 0 : 1150 + absSpeed * 31, gear, torque });
+      const gear = speed < -0.5 ? 'R' : absSpeed < 1 && !accelerating ? 'N' : String(gearIndex + 1);
+      onTelemetry({
+        speed: absSpeed,
+        rpm: absSpeed < 1 && !accelerating ? 0 : 1200 + torque * 6800,
+        gear,
+        torque,
+        shifting: shiftTimer > 0,
+      });
     }
   }
 
@@ -819,6 +882,8 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
       steer: Number(steer.toFixed(2)),
       carX: Number(carX.toFixed(2)),
       torque: Number(torque.toFixed(2)),
+      gear: gearIndex + 1,
+      shifting: shiftTimer > 0,
       floorScroll: Number(raceWorld.floorTexture.offset.y.toFixed(3)),
     },
     wheelsSpinning,
