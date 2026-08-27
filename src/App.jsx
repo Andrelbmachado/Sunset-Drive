@@ -26,7 +26,7 @@ export function App() {
   const [ready, setReady] = useState(false);
   const [phase, setPhase] = useState('menu');
   const [soundOn, setSoundOn] = useState(false);
-  const [telemetry, setTelemetry] = useState({ speed: 0, rpm: 0, gear: 'N', torque: 0 });
+  const [telemetry, setTelemetry] = useState({ speed: 0, rpm: 0, gear: 'N', torque: 0, shifting: false });
 
   useEffect(() => {
     if (!mountRef.current) return undefined;
@@ -92,7 +92,7 @@ export function App() {
       </button>
 
       {phase === 'playing' && (
-        <section className={`speed-hud ${maxed ? 'is-maxed' : ''}`} aria-live="polite" aria-label="Velocímetro">
+        <section className={`speed-hud ${maxed ? 'is-maxed' : ''} ${telemetry.shifting ? 'is-shifting' : ''}`} aria-live="polite" aria-label="Velocímetro">
           <div className="speed-readout"><strong>{String(Math.round(telemetry.speed)).padStart(3, '0')}</strong><span>KM/H</span></div>
           <div className="speed-bars" aria-hidden="true">
             {Array.from({ length: 12 }, (_, index) => <i key={index} className={telemetry.speed > index * 18 ? 'lit' : ''} />)}

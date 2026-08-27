@@ -27,6 +27,10 @@ button { font: inherit; }
 .speed-hud.is-maxed { filter: drop-shadow(0 0 1.4rem rgba(255, 120, 20, .65)); }
 .speed-hud.is-maxed .torque-fill { background: linear-gradient(90deg, #ff7a00, #ffcf5a); box-shadow: 0 0 1rem rgba(255, 140, 0, .8); }
 
+.speed-hud.is-shifting .torque-track { border-color: rgba(255, 210, 90, .85); box-shadow: 0 0 .9rem rgba(255, 200, 60, .5); }
+.speed-hud.is-shifting .torque-label { color: #ffd25a; }
+.speed-hud.is-shifting .gear-readout { color: #ffd25a; }
+
 .sound-toggle { position: absolute; z-index: 4; top: clamp(1rem, 3vw, 2.6rem); right: clamp(1rem, 3vw, 3rem); display: grid; place-items: center; width: 2.7rem; height: 2.7rem; padding: 0; color: #c8bdca; border: 1px solid rgba(255,255,255,.22); border-radius: 50%; background: rgba(5, 0, 13, .6); backdrop-filter: blur(12px); cursor: pointer; transition: .16s ease; }
 .sound-toggle:hover, .sound-toggle:focus-visible, .sound-toggle[aria-pressed="true"] { color: #fff; border-color: #ff3d9e; background: rgba(255, 0, 125, .2); box-shadow: 0 0 1.2rem rgba(255, 0, 125, .25); }
 
