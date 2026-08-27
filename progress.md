@@ -1,5 +1,21 @@
 Original prompt: gere o threejs desse carro, o mais detalhista possivel.
 
+## Track visuals, GLB scenery and two-way traffic
+
+- Replaced the palm and building placeholder boxes with the supplied `Palmeira.glb` and `Building.glb`, copied into `public/assets/` as `palm.glb` and `building.glb` and loaded through `GLTFLoader` without blocking startup.
+- Palms keep their authored material and texture; they read as near-black silhouettes because they sit on their own render layer lit by a single dim hemisphere light, not because the material was darkened. The export's `transmissionFactor: 1` is zeroed, which would otherwise have rendered the fronds as invisible glass.
+- Buildings merge their 13 primitives into one geometry (1 draw call each), take an independent material per instance, alternate through a five-colour tint, and stretch 1x-3x vertically in five tiers.
+- Moved the skyline out from x 23-38 to x 48-76 so it reads as distant, and widened the shoulder plane to 220 units so the ground still reaches it.
+- Added a warm sunset `DirectionalLight` confined to the skyline layer, with shadow casting, so buildings pick up a specular edge and shade their own far faces without washing out the road or the car.
+- Removed the `frontBeam` spotlight that ran down the centre of the track, and its line in `setLights`.
+- Deleted `createCheckerFloorTexture`: the track is now a matte dark surface carrying only neon pink markings. Both side lines changed from cyan to `PINK`, and the centre dash from pale pink to the same neon pink. No blue remains on the track.
+- Traffic now seeds eight cars across the whole corridor the moment a race starts, and 45% of later spawns enter from behind the camera and overtake. Spawns inside the safe zone are filtered to lanes clear of the player's collision band, so nothing can appear on top of the car at the start.
+- Found and fixed a pre-existing cost: the car's glass and headlight lenses carried `transmission`, which forced three.js to render the entire opaque scene a second time every frame. Removing it (the tinted near-black glass looks identical) cut the frame from 863 draw calls / 5.4M triangles to 504 / 3.0M.
+- Measured in the same software renderer, the scene now runs about 0.9 fps against the original 0.5 fps, so the detailed GLB scenery costs less than the duplicate pass it replaced.
+- Browser verification over a 66-second race: eight cars seeded at T+0.1s (six ahead, two behind), zero same-lane spawns inside the safe zone, one to three cars overtaking from behind at any time, and a clean console.
+- Production build and all four Sites tests pass.
+- TODO: none for this request.
+
 ## 2026-08-27
 
 - Reduced the rear license plate to 50% in both dimensions and raised it slightly to clear the exhausts.

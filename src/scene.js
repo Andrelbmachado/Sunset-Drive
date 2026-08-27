@@ -5,11 +5,19 @@ import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import { Reflector } from 'three/examples/jsm/objects/Reflector.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 
 const PINK = 0xff0d87;
 const BLUE = 0x086cff;
 const CAR_BLACK = 0x09090d;
 const ASSET_BASE = import.meta.env.BASE_URL;
+// Only objects on this layer are lit by the sun, so the skyline catches the
+// sunset while the road and the car stay in neon darkness.
+const SUN_LAYER = 1;
+// The palms sit on their own layer instead, reached by a single dim light, so
+// they read as near-black silhouettes without their material being altered.
+const PALM_LAYER = 2;
 
 const cameraPresets = {
   hero: { position: new THREE.Vector3(8.3, 2.5, 9.5), target: new THREE.Vector3(0.25, 0.7, 0.15) },
@@ -86,7 +94,7 @@ function createGlowPanel(width, height, color, intensity = 8) {
   group.add(frame);
   const lens = new THREE.Mesh(
     new THREE.BoxGeometry(width, height, 0.075),
-    new THREE.MeshPhysicalMaterial({ color, emissive: color, emissiveIntensity: intensity, roughness: 0.22, transmission: 0.1, toneMapped: false }),
+    new THREE.MeshPhysicalMaterial({ color, emissive: color, emissiveIntensity: intensity, roughness: 0.22, toneMapped: false }),
   );
   lens.position.z = 0.085;
   group.add(lens);
@@ -299,7 +307,7 @@ function createCar() {
     body: mat(),
     bodyAlt: mat({ color: 0x0d0b12, roughness: 0.24 }),
     carbon: mat({ color: 0x030305, roughness: 0.36, clearcoat: 0.5 }),
-    glass: new THREE.MeshPhysicalMaterial({ color: 0x02040a, metalness: 0.15, roughness: 0.08, transmission: 0.18, transparent: true, opacity: 0.76, clearcoat: 1, envMapIntensity: 0.4 }),
+    glass: new THREE.MeshPhysicalMaterial({ color: 0x02040a, metalness: 0.15, roughness: 0.08, transparent: true, opacity: 0.76, clearcoat: 1, envMapIntensity: 0.4 }),
     interior: mat({ color: 0x08060a, roughness: 0.7, metalness: 0.05 }),
     tire: new THREE.MeshStandardMaterial({ color: 0x070709, roughness: 0.9, metalness: 0.05 }),
     tireSide: new THREE.MeshStandardMaterial({ color: 0x09090b, roughness: 0.82 }),
@@ -446,8 +454,24 @@ const ROAD_LENGTH = 420;
 // past for a given speedometer reading.
 const WORLD_SCALE = 0.22;
 const LANES = [-4.6, -1.55, 1.55, 4.6];
+// Traffic lives on a z corridor that straddles the chase camera (z = -10.4):
+// cars fade in far ahead, or slip in behind the camera and overtake us.
 const TRAFFIC_SPAWN_Z = 210;
-const TRAFFIC_DESPAWN_Z = -28;
+const TRAFFIC_BEHIND_Z = -58;
+const TRAFFIC_DESPAWN_Z = -96;
+const TRAFFIC_FORWARD_LIMIT = 300;
+// Spawns at z below this are close enough to be unavoidable, so they must keep
+// clear of the lane the player is sitting in.
+const TRAFFIC_SAFE_ZONE = 60;
+// A hair wider than the 2.4 collision half-width, so a "safe" lane really is.
+const TRAFFIC_LANE_CLEARANCE = 2.6;
+const TRAFFIC_SEED_COUNT = 8;
+
+// Lanes the player is not currently occupying. LANES spans 9.2 units, so with a
+// 2.6 clearance at least two lanes always survive the filter.
+function safeLanes(x) {
+  return LANES.filter((lane) => Math.abs(lane - x) > TRAFFIC_LANE_CLEARANCE);
+}
 
 function createTraffic(scene) {
   const group = new THREE.Group();
@@ -471,76 +495,100 @@ function createTraffic(scene) {
   return { group, slots };
 }
 
-function createScenery(scene) {
-  const items = [];
+// Both rings are sized so their wrap span just outruns the camera's 260-unit
+// far plane. Anything further only ever renders inside solid fog, and these are
+// detailed meshes rather than the boxes they replaced, so the extra instances
+// would be pure cost.
+const PALM_SPACING = 17.5;
+const PALM_PER_SIDE = 16;
+const BUILDING_SPACING = 31;
+const BUILDING_PER_SIDE = 10;
+// The GLB is a ~2.2 x 3.25 x 2.2 unit block, so it needs a uniform blow-up
+// before the per-instance vertical stretch turns it into a skyline tower.
+const BUILDING_BASE_SCALE = 4;
 
-  // Placeholder cubes standing in for the palm trees that line the road.
-  const palmGeometry = new THREE.BoxGeometry(0.8, 5.4, 0.8);
-  const palmMaterial = new THREE.MeshStandardMaterial({ color: 0x11402f, emissive: 0x0b2a1f, emissiveIntensity: 0.6, roughness: 0.85, metalness: 0 });
-  const palmSpacing = 17.5;
-  const palmPerSide = 26;
-  const palmSpan = palmSpacing * palmPerSide;
-  for (let i = 0; i < palmPerSide * 2; i += 1) {
+function populatePalms(scene, template, items) {
+  // The export ships a fully transmissive material, which would render the
+  // fronds as invisible glass. Zeroing transmission is the only edit made to
+  // it — the baseColor texture stays untouched so the same asset still reads
+  // correctly if it is ever dropped onto a brighter terrain.
+  template.traverse((node) => {
+    if (!node.isMesh) return;
+    if (node.material.transmission !== undefined) node.material.transmission = 0;
+    // Keeps the scene's room environment from lifting the fronds out of
+    // silhouette. The baseColor texture itself is left as authored.
+    node.material.envMapIntensity = 0.03;
+  });
+
+  const span = PALM_SPACING * PALM_PER_SIDE;
+  for (let i = 0; i < PALM_PER_SIDE * 2; i += 1) {
     const side = i % 2 ? 1 : -1;
-    const mesh = new THREE.Mesh(palmGeometry, palmMaterial);
-    mesh.position.set(side * 9.4, 2.7, Math.floor(i / 2) * palmSpacing - 40);
-    mesh.castShadow = true;
-    scene.add(mesh);
-    items.push({ mesh, span: palmSpan });
+    const palm = template.clone(true);
+    // Clones share the template material on purpose: every palm is lit the
+    // same way, so one material keeps the draw calls cheap.
+    palm.scale.setScalar(0.85 + ((i * 3) % 3) * 0.15);
+    palm.rotation.y = (i * 1.73) % (Math.PI * 2);
+    palm.position.set(side * 9.4, 0.03, Math.floor(i / 2) * PALM_SPACING - 40);
+    palm.traverse((node) => node.layers.set(PALM_LAYER));
+    scene.add(palm);
+    items.push({ mesh: palm, span });
   }
-
-  // Dark grey blocks standing in for the skyline buildings further out.
-  const buildingMaterial = new THREE.MeshStandardMaterial({ color: 0x1c1c24, roughness: 0.95, metalness: 0 });
-  const buildingSpacing = 31;
-  const buildingPerSide = 20;
-  const buildingSpan = buildingSpacing * buildingPerSide;
-  for (let i = 0; i < buildingPerSide * 2; i += 1) {
-    const side = i % 2 ? 1 : -1;
-    const height = 9 + ((i * 7) % 5) * 4.6;
-    const width = 5 + ((i * 3) % 4) * 2.2;
-    const mesh = new THREE.Mesh(new THREE.BoxGeometry(width, height, width * 0.9), buildingMaterial);
-    mesh.position.set(side * (23 + ((i * 5) % 3) * 7.5), height / 2, Math.floor(i / 2) * buildingSpacing - 40);
-    scene.add(mesh);
-    items.push({ mesh, span: buildingSpan });
-  }
-
-  return { items };
 }
 
-function createCheckerFloorTexture() {
-  const size = 256;
-  const canvas = document.createElement('canvas');
-  canvas.width = size;
-  canvas.height = size;
-  const ctx = canvas.getContext('2d');
-  const cell = size / 2;
-  const colors = ['#050212', '#3d1362'];
-  for (let y = 0; y < 2; y += 1) {
-    for (let x = 0; x < 2; x += 1) {
-      ctx.fillStyle = colors[(x + y) % 2];
-      ctx.fillRect(x * cell, y * cell, cell, cell);
-    }
+function populateBuildings(scene, template, items) {
+  // All 13 primitives carry default (white, fully metallic) materials that we
+  // overwrite with one tint per building anyway, so merging them collapses 13
+  // draw calls per instance down to 1.
+  template.updateWorldMatrix(true, true);
+  const parts = [];
+  template.traverse((node) => {
+    if (!node.isMesh) return;
+    parts.push(node.geometry.clone().applyMatrix4(node.matrixWorld));
+  });
+  const geometry = mergeGeometries(parts);
+  parts.forEach((part) => part.dispose());
+  geometry.computeBoundingBox();
+  const bounds = geometry.boundingBox;
+  // Recentre on x/z and drop the base to y = 0 so placement is predictable.
+  geometry.translate(-(bounds.min.x + bounds.max.x) / 2, -bounds.min.y, -(bounds.min.z + bounds.max.z) / 2);
+
+  const tints = [0xff2e88, 0x2ecbff, 0x7a3cff, 0xffa63d, 0x3affc1];
+  const span = BUILDING_SPACING * BUILDING_PER_SIDE;
+  for (let i = 0; i < BUILDING_PER_SIDE * 2; i += 1) {
+    const side = i % 2 ? 1 : -1;
+    const tint = new THREE.Color(tints[i % tints.length]);
+    // One material per building, otherwise every instance would share — and
+    // overwrite — the same tint.
+    const material = new THREE.MeshStandardMaterial({
+      color: tint.clone().multiplyScalar(0.5),
+      // Just enough self-light to stay readable through the fog, not enough to
+      // flatten the sun's shading.
+      emissive: tint.clone().multiplyScalar(0.05),
+      metalness: 0.3,
+      roughness: 0.38,
+      envMapIntensity: 0.25,
+    });
+    const mesh = new THREE.Mesh(geometry, material);
+    // Alternating 1x-3x vertical stretch breaks up the skyline silhouette.
+    mesh.scale.set(BUILDING_BASE_SCALE, BUILDING_BASE_SCALE * (1 + ((i * 7) % 5) * 0.5), BUILDING_BASE_SCALE);
+    mesh.rotation.y = side > 0 ? Math.PI : 0;
+    mesh.position.set(side * (48 + ((i * 5) % 3) * 14), 0, Math.floor(i / 2) * BUILDING_SPACING - 40);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    mesh.layers.set(SUN_LAYER);
+    scene.add(mesh);
+    items.push({ mesh, span });
   }
-  ctx.strokeStyle = '#ff1f9b';
-  ctx.lineWidth = 5;
-  ctx.shadowColor = '#ff1f9b';
-  ctx.shadowBlur = 18;
-  ctx.beginPath();
-  ctx.moveTo(0, cell + 0.5);
-  ctx.lineTo(size, cell + 0.5);
-  ctx.moveTo(cell + 0.5, 0);
-  ctx.lineTo(cell + 0.5, size);
-  ctx.stroke();
-  ctx.strokeStyle = '#37b8ff';
-  ctx.lineWidth = 2;
-  ctx.shadowBlur = 10;
-  ctx.shadowColor = '#37b8ff';
-  ctx.strokeRect(1, 1, size - 2, size - 2);
-  const texture = new THREE.CanvasTexture(canvas);
-  texture.colorSpace = THREE.SRGBColorSpace;
-  texture.wrapS = THREE.RepeatWrapping;
-  texture.wrapT = THREE.RepeatWrapping;
-  return texture;
+}
+
+function createScenery(scene) {
+  // `items` is handed back immediately and only ever appended to, so the render
+  // loop can iterate an empty array for the frames before the models land.
+  const items = [];
+  const loader = new GLTFLoader();
+  loader.load(`${ASSET_BASE}assets/palm.glb`, (gltf) => populatePalms(scene, gltf.scene, items));
+  loader.load(`${ASSET_BASE}assets/building.glb`, (gltf) => populateBuildings(scene, gltf.scene, items));
+  return { items };
 }
 
 function createDashTexture(color) {
@@ -561,21 +609,19 @@ function createDashTexture(color) {
 
 function createRaceWorld(scene, renderer) {
   const loader = new THREE.TextureLoader();
-  const floorTexture = createCheckerFloorTexture();
-  // Square cells: 5 repeats across the 14.8-wide road, 142 along its length.
-  floorTexture.repeat.set(5, 142);
-  floorTexture.anisotropy = Math.min(renderer.capabilities.getMaxAnisotropy(), 8);
 
+  // The track carries no fill at all: it is a matte dark surface that only the
+  // neon lane markings sit on top of.
   const road = new THREE.Mesh(
     new THREE.PlaneGeometry(ROAD_HALF_WIDTH * 2, ROAD_LENGTH),
-    new THREE.MeshStandardMaterial({ map: floorTexture, emissiveMap: floorTexture, emissive: 0x3d0f36, emissiveIntensity: 0.6, roughness: 1, metalness: 0 }),
+    new THREE.MeshStandardMaterial({ color: 0x0d0718, roughness: 1, metalness: 0 }),
   );
   road.rotation.x = -Math.PI / 2;
   road.position.set(0, 0, 120);
   road.receiveShadow = true;
   scene.add(road);
 
-  const centerDash = createDashTexture('#ffe6f7');
+  const centerDash = createDashTexture('#ff0d87');
   centerDash.repeat.set(1, 130);
   const centerLine = new THREE.Mesh(
     new THREE.PlaneGeometry(0.32, 420),
@@ -588,7 +634,7 @@ function createRaceWorld(scene, renderer) {
   [-1, 1].forEach((side) => {
     const edge = new THREE.Mesh(
       new THREE.PlaneGeometry(0.22, 420),
-      new THREE.MeshBasicMaterial({ color: 0x20e4ff, transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false }),
+      new THREE.MeshBasicMaterial({ color: PINK, transparent: true, opacity: 0.95, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false }),
     );
     edge.rotation.x = -Math.PI / 2;
     edge.position.set(side * ROAD_HALF_WIDTH, 0.014, 120);
@@ -596,7 +642,7 @@ function createRaceWorld(scene, renderer) {
   });
 
   const shoulder = new THREE.Mesh(
-    new THREE.PlaneGeometry(72, 420),
+    new THREE.PlaneGeometry(220, 420),
     new THREE.MeshBasicMaterial({ color: 0x090117 }),
   );
   shoulder.rotation.x = -Math.PI / 2;
@@ -622,7 +668,7 @@ function createRaceWorld(scene, renderer) {
   renderer.shadowMap.enabled = true;
   const traffic = createTraffic(scene);
   const scenery = createScenery(scene);
-  return { floorTexture, centerDash, traffic, scenery };
+  return { centerDash, traffic, scenery };
 }
 
 export function createNeonCarExperience(container, { onReady, onTelemetry }) {
@@ -631,6 +677,8 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   scene.fog = new THREE.FogExp2(0x120526, 0.009);
   const camera = new THREE.PerspectiveCamera(42, container.clientWidth / container.clientHeight, 0.1, 260);
   camera.position.set(0, 3.15, -10.4);
+  camera.layers.enable(SUN_LAYER);
+  camera.layers.enable(PALM_LAYER);
   const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: 'high-performance' });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.75));
   renderer.setSize(container.clientWidth, container.clientHeight);
@@ -665,14 +713,37 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   keyBlue.position.set(6, 4, -5);
   keyBlue.target.position.set(0, 0.7, 0);
   scene.add(keyBlue, keyBlue.target);
-  const frontBeam = new THREE.SpotLight(0xffd9f4, 10, 16, Math.PI / 8, 0.8, 1.4);
-  frontBeam.position.set(0, 1, 3.4);
-  frontBeam.target.position.set(0, 0.3, 9);
-  scene.add(frontBeam, frontBeam.target);
+  // Low sunset sun, raking in from the side so the skyline picks up a warm
+  // specular edge and shades its own far faces. It is confined to SUN_LAYER so
+  // it never washes out the road, the car or the palms.
+  const sun = new THREE.DirectionalLight(0xffa273, 3.6);
+  sun.position.set(60, 30, 140);
+  sun.target.position.set(0, 0, 120);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(1024, 1024);
+  sun.shadow.bias = -0.0006;
+  // Only the stretch of skyline actually on screen needs shadow coverage.
+  Object.assign(sun.shadow.camera, { left: -95, right: 95, top: 95, bottom: -95, near: 20, far: 230 });
+  sun.shadow.camera.updateProjectionMatrix();
+  sun.layers.set(SUN_LAYER);
+  sun.target.layers.set(SUN_LAYER);
+  scene.add(sun, sun.target);
+  // Dim cool fill so the faces the sun misses keep their own colour instead of
+  // going flat black, without competing with the sun's shading.
+  const skylineFill = new THREE.HemisphereLight(0x39215e, 0x0a0416, 0.6);
+  skylineFill.layers.set(SUN_LAYER);
+  scene.add(skylineFill);
+  // The palms' only light source: dim, cool and purely ambient.
+  const palmFill = new THREE.HemisphereLight(0x452a6b, 0x05010a, 0.12);
+  palmFill.layers.set(PALM_LAYER);
+  scene.add(palmFill);
   const rearGlow = new THREE.PointLight(0xff003f, 12, 6, 2);
   rearGlow.position.set(0, 0.7, -3.8);
   scene.add(rearGlow);
 
+  // Let render stats accumulate across all composer passes so the telemetry
+  // hook reports a whole frame, not just the final blit.
+  renderer.info.autoReset = false;
   const composer = new EffectComposer(renderer);
   composer.addPass(new RenderPass(scene, camera));
   composer.addPass(new UnrealBloomPass(new THREE.Vector2(container.clientWidth, container.clientHeight), 0.36, 0.35, 0.87));
@@ -726,6 +797,7 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   let spawnTimer = 0;
   let impactFlash = 0;
   let collisions = 0;
+  let wasRunning = false;
   const DIFFICULTY_RAMP = 90;
   const CAMERA_Z = -10.4;
   const TARGET_Z = 5.2;
@@ -825,7 +897,6 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     // One shared distance drives the texture scroll, the traffic and the
     // scenery, so the whole world moves at the speed on the dial.
     travelThisFrame = speed * WORLD_SCALE * delta;
-    raceWorld.floorTexture.offset.y = (raceWorld.floorTexture.offset.y - travelThisFrame * (raceWorld.floorTexture.repeat.y / ROAD_LENGTH)) % 1;
     raceWorld.centerDash.offset.y = (raceWorld.centerDash.offset.y - travelThisFrame * (raceWorld.centerDash.repeat.y / ROAD_LENGTH)) % 1;
     wheelsSpinning = Math.abs(speed) > 0.5;
 
@@ -919,18 +990,43 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     return THREE.MathUtils.clamp(raceTime / DIFFICULTY_RAMP, 0, 1);
   }
 
-  function spawnTrafficCar() {
+  // Cars appearing far ahead can use any lane — there is time to react. Anything
+  // spawning close to or behind us is unavoidable, so it has to keep out of the
+  // lane we are in.
+  function pickLane(spawnZ) {
+    const options = spawnZ < TRAFFIC_SAFE_ZONE ? safeLanes(carX) : LANES;
+    return options[Math.floor(Math.random() * options.length)];
+  }
+
+  function spawnTrafficCar({ fromBehind = false, forcedZ = null } = {}) {
     const slot = raceWorld.traffic.slots.find((entry) => !entry.active);
     if (!slot) return;
     const level = difficulty();
-    const lane = LANES[Math.floor(Math.random() * LANES.length)];
+    const spawnZ = forcedZ ?? (fromBehind
+      ? TRAFFIC_BEHIND_Z - Math.random() * 22
+      : TRAFFIC_SPAWN_Z + Math.random() * 40);
     slot.active = true;
     slot.hit = false;
+    // Traffic drifts by at the closing speed between us, so a car coming up
+    // from behind only reads as an overtake while it outruns the player.
     // Faster traffic later on leaves less room to weave through.
-    slot.speed = THREE.MathUtils.lerp(70, 150, level) + Math.random() * 25;
+    slot.speed = fromBehind
+      ? speed + THREE.MathUtils.lerp(25, 60, level) + Math.random() * 20
+      : THREE.MathUtils.lerp(70, 150, level) + Math.random() * 25;
     slot.mesh.visible = true;
-    slot.mesh.position.set(lane, 0.68, TRAFFIC_SPAWN_Z + Math.random() * 40);
+    slot.mesh.position.set(pickLane(spawnZ), 0.68, spawnZ);
     slot.mesh.material.emissiveIntensity = 0.45;
+  }
+
+  // The road starts populated end to end rather than filling in over the first
+  // few seconds. This deliberately overshoots the difficulty-ramped cap; the
+  // grid thins back out to it as the seeded cars clear the corridor.
+  function seedTraffic() {
+    for (let i = 0; i < TRAFFIC_SEED_COUNT; i += 1) {
+      const t = i / (TRAFFIC_SEED_COUNT - 1);
+      const z = THREE.MathUtils.lerp(TRAFFIC_BEHIND_Z - 12, TRAFFIC_SPAWN_Z + 60, t) + (Math.random() - 0.5) * 18;
+      spawnTrafficCar({ fromBehind: z < 0, forcedZ: z });
+    }
   }
 
   function updateTraffic(delta) {
@@ -940,7 +1036,12 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
       raceTime = 0;
       spawnTimer = 0;
       collisions = 0;
+      wasRunning = false;
       return;
+    }
+    if (!wasRunning) {
+      seedTraffic();
+      wasRunning = true;
     }
 
     raceTime += delta;
@@ -949,15 +1050,14 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     const maxActive = Math.round(THREE.MathUtils.lerp(2, 9, level));
     spawnTimer -= delta;
     if (spawnTimer <= 0 && activeCount < maxActive) {
-      spawnTrafficCar();
+      spawnTrafficCar({ fromBehind: Math.random() < 0.45 });
       spawnTimer = THREE.MathUtils.lerp(2.8, 0.75, level) * (0.7 + Math.random() * 0.6);
     }
 
     slots.forEach((slot) => {
       if (!slot.active) return;
-      // Traffic drifts toward the camera at the closing speed between us.
       slot.mesh.position.z -= (speed - slot.speed) * WORLD_SCALE * delta;
-      if (slot.mesh.position.z < TRAFFIC_DESPAWN_Z || slot.mesh.position.z > TRAFFIC_SPAWN_Z + 90) {
+      if (slot.mesh.position.z < TRAFFIC_DESPAWN_Z || slot.mesh.position.z > TRAFFIC_FORWARD_LIMIT) {
         slot.active = false;
         slot.mesh.visible = false;
         return;
@@ -1026,6 +1126,7 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     updateDriving(delta, elapsed);
     const maxed = raceRunning && torque > 0.92 && speed > MAX_SPEED - 8;
     update(delta, elapsed, maxed);
+    renderer.info.reset();
     const glowPulse = lightsEnabled ? 2.7 + Math.sin(elapsed * 2.2) * 0.18 : 0;
     model.lightMeshes.forEach((lens) => { lens.material.emissiveIntensity = glowPulse; });
     controls.update();
@@ -1059,11 +1160,26 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     },
     traffic: {
       active: raceWorld.traffic.slots.filter((slot) => slot.active).length,
+      ahead: raceWorld.traffic.slots.filter((slot) => slot.active && slot.mesh.position.z >= 0).length,
+      behind: raceWorld.traffic.slots.filter((slot) => slot.active && slot.mesh.position.z < 0).length,
+      // Any car close enough to be unavoidable that is sharing our lane band.
+      playerLaneIntrusions: raceWorld.traffic.slots.filter((slot) => slot.active
+        && Math.abs(slot.mesh.position.z) < TRAFFIC_SAFE_ZONE
+        && Math.abs(slot.mesh.position.x - carX) <= TRAFFIC_LANE_CLEARANCE).length,
       maxActive: Math.round(THREE.MathUtils.lerp(2, 9, THREE.MathUtils.clamp(raceTime / DIFFICULTY_RAMP, 0, 1))),
       raceTime: Number(raceTime.toFixed(1)),
       collisions,
     },
-    floorScroll: Number(raceWorld.floorTexture.offset.y.toFixed(3)),
+    render: {
+      drawCalls: renderer.info.render.calls,
+      triangles: renderer.info.render.triangles,
+    },
+    scenery: {
+      loaded: raceWorld.scenery.items.length,
+      palms: raceWorld.scenery.items.filter((item) => item.span === PALM_SPACING * PALM_PER_SIDE).length,
+      buildings: raceWorld.scenery.items.filter((item) => item.span === BUILDING_SPACING * BUILDING_PER_SIDE).length,
+    },
+    floorScroll: Number(raceWorld.centerDash.offset.y.toFixed(3)),
     wheelsSpinning,
     backfire: {
       active: backfireTime > 0,
@@ -1093,6 +1209,7 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
       update(1 / 60, stepElapsed, maxed);
     }
     controls.update();
+    renderer.info.reset();
     composer.render();
   };
 
@@ -1115,7 +1232,6 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
       lightsEnabled = enabled;
       keyPink.intensity = enabled ? 28 : 8;
       keyBlue.intensity = enabled ? 24 : 8;
-      frontBeam.intensity = enabled ? 10 : 0;
       rearGlow.intensity = enabled ? 12 : 0;
     },
     setWheelsSpinning(enabled) { wheelsSpinning = enabled; },
