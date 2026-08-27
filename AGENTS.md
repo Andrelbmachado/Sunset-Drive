@@ -30,3 +30,7 @@ Build app UI in `src/`. Keep `.openai/hosting.json`, `worker/index.js`, `scripts
 - Skyline buildings use `public/assets/building.glb`, sit far out to the sides to read as distant, stretch between 1x and 3x vertically, and alternate tint colours. They are the only scenery the sunset `DirectionalLight` touches.
 - Traffic populates the road from the moment a race starts and arrives from behind the player as well as ahead. No car may ever spawn within the player's collision band while it is close enough to be unavoidable.
 - Keep car materials free of `transmission`: any non-zero value makes three.js render the whole opaque scene a second time per frame.
+- Cars are impenetrable. Contacts resolve on the axis of least penetration: side-swipes throw both bodies apart laterally, rear-enders hand closing speed forward. Traffic must never spawn on a spot another car already occupies.
+- The sides of the world stay filled with buildings: a detailed GLB ring near the road, and merged box LODs beyond it. Only place columns inside the camera's horizontal cone, otherwise the geometry can never be seen.
+- White speed streaks appear only at max speed.
+- Camera settings expose focus distance, angle and height at centimetre/tenth-degree resolution.

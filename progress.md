@@ -1,5 +1,21 @@
 Original prompt: gere o threejs desse carro, o mais detalhista possivel.
 
+## Collision physics, filled skyline, wind and camera focus
+
+- Traffic and the player are now impenetrable bodies. Contacts separate along whichever axis the pair is least buried in, which is what tells a side-swipe apart from a rear-end: sideways contacts push both cars clear and throw them apart laterally, rear contacts hand closing speed from the car behind to the car ahead.
+- The player carries its own lateral velocity so a side hit shoves the car and decays, rather than teleporting it.
+- Traffic-to-traffic runs three solver iterations, because separating one pair can push a car into the next once three or more pile up.
+- Spawns now check the target spot is free. That, not the solver, was the source of the residual overlaps: cars were being placed on top of existing ones and then visibly shoved apart. Verified over 30 s of weaving at full throttle with zero interpenetration between any pair or against the player.
+- Skyline is roughly 10x denser. The detailed GLB ring stays near the road; everything beyond is stretched boxes merged into eight z-slices, so ~240 extra buildings cost eight draw calls. Columns are placed inside the camera's horizontal cone — a building needs `z > x / tan(34°)` to ever enter frame, so columns further out than that are geometry nobody sees.
+- Fog thinned from 0.009 to 0.0062 and the far plane pushed to 340 so the skyline reads all the way out.
+- Lowpoly boulders fill the verge between the palms and the skyline, merged into blocks the same way.
+- White speed streaks tear past the car once it is pinned at max speed, as one LineSegments object.
+- Track speed doubled, the grid went from 5 to 10 cells across, and the neon lines are a third of their previous thickness. The road material is now unlit so no lamp can wash the cells between the lines.
+- Settings gained a FOCO slider that moves the chase camera between 4.5 m and 26 m in 1 cm steps; angle and height now step in tenths and centimetres.
+- Verified in the browser: max speed reached with the wind firing, zero interpenetration, and a clean console.
+- Production build and all four Sites tests pass.
+- TODO: none for this request.
+
 ## Neon grid road
 
 - Rebuilt the track as the classic synthwave neon grid from the supplied reference: transverse rungs that scroll with the car plus fixed longitudinal rails, both on the same 2.96-unit pitch so the cells read as squares.

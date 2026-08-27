@@ -36,7 +36,7 @@ export function App() {
   const [phase, setPhase] = useState('menu');
   const [soundOn, setSoundOn] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [camera, setCamera] = useState({ height: 3.15, angle: 8 });
+  const [camera, setCamera] = useState({ height: 3.15, angle: 8, distance: 10.4 });
   const [telemetry, setTelemetry] = useState({ speed: 0, rpm: 0, gear: 'N', torque: 0, shifting: false });
 
   useEffect(() => {
@@ -124,16 +124,24 @@ export function App() {
       {settingsOpen && (
         <div className="settings-panel" role="group" aria-label="Configurações de câmera">
           <label>
-            <span>ÂNGULO<i>{Math.round(camera.angle)}°</i></span>
+            <span>FOCO<i>{camera.distance.toFixed(2)} m</i></span>
             <input
-              type="range" min="-2" max="30" step="1" value={camera.angle}
+              type="range" min="4.5" max="26" step="0.01" value={camera.distance}
+              onChange={(event) => updateCamera({ distance: Number(event.target.value) })}
+            />
+            <em>carro ← → cenário</em>
+          </label>
+          <label>
+            <span>ÂNGULO<i>{camera.angle.toFixed(1)}°</i></span>
+            <input
+              type="range" min="-2" max="30" step="0.1" value={camera.angle}
               onChange={(event) => updateCamera({ angle: Number(event.target.value) })}
             />
           </label>
           <label>
-            <span>ALTURA<i>{camera.height.toFixed(1)}</i></span>
+            <span>ALTURA<i>{camera.height.toFixed(2)} m</i></span>
             <input
-              type="range" min="1.4" max="9" step="0.1" value={camera.height}
+              type="range" min="1.4" max="9" step="0.01" value={camera.height}
               onChange={(event) => updateCamera({ height: Number(event.target.value) })}
             />
           </label>
