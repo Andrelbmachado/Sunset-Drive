@@ -1212,7 +1212,10 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   const MAX_SPEED = MAX_PLAYER_SPEED;
   const MAX_REVERSE = -55;
   // Five gears, each covering its own speed band in roughly GEAR_SECONDS of
-  // throttle, so a full pull from a standstill to MAX_SPEED takes ~10 s.
+  // throttle. Without the shift overhead that would put a full pull at
+  // 5 * GEAR_SECONDS; four shifts each cost SHIFT_SECONDS plus the time spent
+  // regaining SHIFT_SPEED_LOSS, which is what the constant below is tuned
+  // against so the measured 0-220 km/h run lands at ~7 s.
   const GEARS = [
     { min: 0, max: 55 },
     { min: 55, max: 100 },
@@ -1220,8 +1223,7 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     { min: 140, max: 180 },
     { min: 180, max: MAX_SPEED },
   ];
-  // Halved, so torque builds — and therefore speed climbs — at twice the old rate.
-  const GEAR_SECONDS = 2;
+  const GEAR_SECONDS = 1.05;
   const SHIFT_SECONDS = 0.42;
   const SHIFT_SPEED_LOSS = 9;
   const LAUNCH_SECONDS = 0.55;
