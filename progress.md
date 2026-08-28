@@ -1,5 +1,43 @@
 Original prompt: gere o threejs desse carro, o mais detalhista possivel.
 
+## 2026-08-27 — Final validation for scenery, traffic and audio pass
+
+- Final prescribed Playwright capture starts with `assetsReady: true`, 40 active cars, zero player-lane intrusions, zero traffic overlaps, zero player overlaps and a running AudioContext.
+- Deterministic full-throttle run reached 219.2 km/h with turbo active, four gear-shift events, 43 active traffic cars, fastest traffic at 205.2 km/h against the hard 215.6 km/h cap, zero collisions and zero overlaps.
+- Visually inspected the ready-state and max-speed screenshots: sun stays fixed on the centre horizon, the road converges without closing to a point, the dense brown-black stone bed fills both verges, and the car centre remains dark while buildings retain sunset light.
+- Production build and all four Sites tests pass; final browser error logs are empty and `git diff --check` is clean.
+- TODO: none for this request.
+
+## 2026-08-27 — Procedural driving audio and fixed sun
+
+- Replaced the looping MP3 element with a lazy Web Audio graph started by the JOGAR gesture and controlled by the existing sound button.
+- Added an RPM-driven two-oscillator engine, acceleration transient, filtered brake-noise burst, gear-shift pitch drop, and continuous/entry turbo treatment at maximum speed.
+- Audio telemetry reports enabled/context state, engine level, turbo state, last effect and per-effect event counts.
+- Playwright confirmed a running audio context and the braking event after an acceleration/brake sequence, with no browser error artifact.
+- The camera-locked sky was vertically aligned so the sun is visible on the central horizon while remaining horizontally fixed during camera motion.
+- Reduced the car body's environment response to remove the residual white centre glare; the directional sunset remains exclusive to the building layer.
+- Verified in the deterministic max-speed run: four gear shifts, one max-turbo event, turbo active in the captured state, and the darker body visually reviewed.
+
+## 2026-08-27 — Dense traffic and predictive lane changes
+
+- Traffic pool increased to 64 slots, with an immediate seed of 40 cars and a steady-state cap of 45.
+- Seed layout starts with eight safe outer-lane cars behind the camera and thirty-two staggered cars ahead; the first automated capture reports exactly 40 active cars and zero player-lane intrusions.
+- Cruise speeds now use slow, medium and fast bands and are hard-capped at 215.6 km/h (98% of the player's 220 km/h maximum), including speed transferred by collisions.
+- Traffic calculates closing time to the nearest same-lane lead car, changes to the safest adjacent lane when possible, and blends down toward the lead car when both sides are blocked.
+- Lane changes use bounded lateral motion, a cooldown and player-safe candidate filtering; telemetry now reports active/changing cars, cumulative lane changes, fastest traffic speed and the configured limit.
+- Playwright state after the seed: 40 active, 5 lane changes, 0 body overlaps, 0 player overlaps, 0 collisions, and no console-error artifact.
+- Verified in the long run at 219.2 km/h with zero collisions/overlaps and traffic remaining below its 215.6 km/h cap.
+
+## 2026-08-27 — Scenery loading, tapered road and stone ground
+
+- The loading screen now waits for the palm GLB, building GLB and synthwave sky texture before enabling the race.
+- Scenery starts in the forward corridor, is hidden outside the render corridor, and is recycled only after passing behind the chase camera.
+- The sun backdrop is attached to the camera and cover-fitted on resize, keeping its centre fixed on screen; the old world-space horizon flare was removed.
+- Road, scrolling rungs and longitudinal rails now share tapered geometry with a non-zero far width so the road narrows without ending in a point.
+- Neon profiles are one third of their previous width and use a multi-stop pink-to-white gradient.
+- Sparse tall boulders were replaced by seven merged blocks of dense, closed icosahedral stones in brown-black tones, capped at 0.52 world units high.
+- Verified visually in both ready-state and max-speed browser captures; the final console-error logs are empty.
+
 ## Collision physics, filled skyline, wind and camera focus
 
 - Traffic and the player are now impenetrable bodies. Contacts separate along whichever axis the pair is least buried in, which is what tells a side-swipe apart from a rear-end: sideways contacts push both cars clear and throw them apart laterally, rear contacts hand closing speed from the car behind to the car ahead.
@@ -94,3 +132,13 @@ Original prompt: gere o threejs desse carro, o mais detalhista possivel.
 - Browser console contains no warnings or errors.
 - Production build and all four Sites tests pass; refreshed deliverable ZIP passes integrity validation.
 - TODO: none for this request.
+## Horizon, full sun and distant road taper
+
+- Aligned the chase camera horizontally so the geometric road horizon remains at the exact vertical centre of the screen.
+- Kept the striped sunset background locked to the camera and fully visible while driving or steering.
+- Moved the road taper much closer to the player and reduced its far end to a narrow, non-zero continuation, producing the requested near-triangular silhouette without terminating the road.
+- Made traffic lanes follow the tapered road and staggered the 40-car initial seed longitudinally so dense traffic stays on the narrowing track without spawning overlaps.
+- Added horizon and taper values to `render_game_to_text` for deterministic validation.
+- Prescribed Playwright capture and the integrated GPU browser both show the full sun, centred horizon and near-triangular road; the running view starts with the dense 40-car field and the browser console is clean.
+- Production build, all four Sites tests and `git diff --check` pass.
+- TODO: verify the GitHub Pages deployment after pushing `main`.

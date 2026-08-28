@@ -1,8 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { createNeonCarExperience } from './scene.js';
 
-const ASSET_BASE = import.meta.env.BASE_URL;
-
 function GearIcon() {
   return (
     <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -31,12 +29,11 @@ function SoundIcon({ on }) {
 export function App() {
   const mountRef = useRef(null);
   const experienceRef = useRef(null);
-  const audioRef = useRef(null);
   const [ready, setReady] = useState(false);
   const [phase, setPhase] = useState('menu');
   const [soundOn, setSoundOn] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [camera, setCamera] = useState({ height: 3.15, angle: 8, distance: 10.4 });
+  const [camera, setCamera] = useState({ height: 3.15, angle: 0, distance: 10.4 });
   const [telemetry, setTelemetry] = useState({ speed: 0, rpm: 0, gear: 'N', torque: 0, shifting: false });
 
   useEffect(() => {
@@ -55,29 +52,20 @@ export function App() {
   const startRace = async () => {
     experienceRef.current?.setRunning(true);
     setPhase('playing');
-    if (audioRef.current) {
-      audioRef.current.volume = 0.44;
-      try {
-        await audioRef.current.play();
-        setSoundOn(true);
-      } catch {
-        setSoundOn(false);
-      }
+    try {
+      const enabled = await experienceRef.current?.setSoundEnabled(true);
+      setSoundOn(Boolean(enabled));
+    } catch {
+      setSoundOn(false);
     }
   };
 
   const toggleSound = async () => {
-    if (!audioRef.current) return;
-    if (soundOn) {
-      audioRef.current.pause();
+    try {
+      const enabled = await experienceRef.current?.setSoundEnabled(!soundOn);
+      setSoundOn(Boolean(enabled));
+    } catch {
       setSoundOn(false);
-    } else {
-      try {
-        await audioRef.current.play();
-        setSoundOn(true);
-      } catch {
-        setSoundOn(false);
-      }
     }
   };
 
@@ -93,7 +81,6 @@ export function App() {
 
   return (
     <main className="racer-shell">
-      <audio ref={audioRef} src={`${ASSET_BASE}assets/game-sfx.mp3`} loop preload="auto" />
       <div ref={mountRef} className="three-stage" role="img" aria-label="Corrida synthwave em terceira pessoa com supercarro ao centro" />
 
       <div className={`loading-screen ${ready ? 'is-ready' : ''}`} aria-hidden={ready}>
