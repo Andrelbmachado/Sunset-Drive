@@ -141,4 +141,5 @@ Original prompt: gere o threejs desse carro, o mais detalhista possivel.
 - Added horizon and taper values to `render_game_to_text` for deterministic validation.
 - Prescribed Playwright capture and the integrated GPU browser both show the full sun, centred horizon and near-triangular road; the running view starts with the dense 40-car field and the browser console is clean.
 - Production build, all four Sites tests and `git diff --check` pass.
-- TODO: verify the GitHub Pages deployment after pushing `main`.
+- GitHub Pages run 7 completed successfully and the public custom-domain URL serves the matching production bundle `index-BVUArT1L.js`.
+- TODO: none for this request.
