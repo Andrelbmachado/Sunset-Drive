@@ -28,7 +28,7 @@ export function createCarAudio({ musicUrl } = {}) {
   let musicVolume = 0.5;
   let sfxVolume = 0.72;
   let musicPlaying = false;
-  const events = { accelerating: 0, braking: 0, gearShift: 0, maxTurbo: 0, swerve: 0, shot: 0, launch: 0 };
+  const events = { accelerating: 0, braking: 0, gearShift: 0, maxTurbo: 0, swerve: 0, shot: 0, launch: 0, coin: 0, ramp: 0 };
 
   function ensureMusic() {
     if (musicElement || !musicUrl) return musicElement;
@@ -156,6 +156,25 @@ export function createCarAudio({ musicUrl } = {}) {
     tone({ from: 900, to: 2400, duration: 0.5, gain: 0.045, type: 'sine', delay: 0.05 });
     lastEffect = 'neon-launch';
     events.launch += 1;
+  }
+
+  // Rising whoosh for the side-ramp launch — distinct from the neon-cannon
+  // launchHit(), which is a heavy metallic slam for hitting another car.
+  function rampJump() {
+    if (!context || !enabled) return;
+    tone({ from: 220, to: 980, duration: 0.5, gain: 0.11, type: 'sawtooth' });
+    noiseBurst({ duration: 0.4, frequency: 500, sweepTo: 2200, gain: 0.05, q: 1.4 });
+    lastEffect = 'ramp-jump';
+    events.ramp += 1;
+  }
+
+  // Two quick ascending tones, the classic arcade coin-pickup blip.
+  function coin() {
+    if (!context || !enabled) return;
+    tone({ from: 1180, to: 1180, duration: 0.09, gain: 0.09, type: 'square' });
+    tone({ from: 1580, to: 1580, duration: 0.14, gain: 0.09, type: 'square', delay: 0.07 });
+    lastEffect = 'coin';
+    events.coin += 1;
   }
 
   function applyMusicVolume() {
@@ -291,5 +310,5 @@ export function createCarAudio({ musicUrl } = {}) {
     context = null;
   }
 
-  return { setEnabled, setMusicVolume, setSfxVolume, update, swerve, shot, launchHit, getState, dispose };
+  return { setEnabled, setMusicVolume, setSfxVolume, update, swerve, shot, launchHit, coin, rampJump, getState, dispose };
 }

@@ -1,5 +1,20 @@
 Original prompt: gere o threejs desse carro, o mais detalhista possivel.
 
+## 2026-08-28 — Gauge HUD, coins, machine-gun cannon and the side ramp
+
+- Torque now rises and falls at the same rate (`TORQUE_RATE = 1/GEAR_SECONDS`); off-throttle coasting decelerates at the current gear's own acceleration rate instead of a flat `COAST_DECEL` that used to decelerate harder than any gear could accelerate. Verified with a clean 400ms trace either side of releasing the throttle: coast torque drops at ~0.95/s, matching `TORQUE_RATE` (1/1.05) precisely.
+- The neon cannon dropped its cooldown gate. A tap fires immediately every time, however fast the user clicks (verified 6 taps in ~100ms all landed); holding the key auto-fires at a fixed 2/s (verified: 4 shots over a 2s hold).
+- Replaced the digital speed/torque readout with a circular gauge: an outer ring for speed and a smaller inner ring for torque, sharing a bottom gap and sweeping clockwise, with the speed number centred inside. Got the rotation math wrong on the first pass reading a small thumbnail in a busy 3D scene; an isolated plain-background test page proved the arcs and sweep direction were actually correct, and the "bug" was a misread.
+- Added a "?" icon button beside the settings gear, opening a keybindings panel; the two panels now close each other so they never stack.
+- Added a top-left stat row: cars hit by the neon cannon, and gold coins collected.
+- Added gold coin pickups: a 10-coin scrolling pool that respawns ahead in a random lane on collection or on scrolling past uncollected, with a distinct pickup chime. Bumped emissive intensity from 0.55 to 2.4 after the first pass proved nearly invisible at a distance against the busy neon background.
+- Added the side ramp: a single-lane exit that peels off the outer lane, climbs on a ski-jump curve, and launches the car airborne at the lip — landing back on the main road under gravity, x easing back toward centre during the flight. Built once and mirrored per spawn via `scale.x`.
+  - First launch-velocity tuning sent the car clean off the top of the frame: the chase camera holds a fixed height rather than following the car vertically (a deliberate, pre-existing design choice, not something to change), so the physically-derived slope-times-speed velocity (~18 units/s) was retuned down to a clamped 5-7.5 range that stays inside the fixed frame at highway speed.
+  - Found and fixed a real bug via a two-cycle stress test: the ramp mesh could despawn (`rampActive = false`) while the player was still mid-flight on it, which made `updateRamp`'s own `if (!rampActive) return` guard skip the rest of its state machine — stranding `rampState` off `'none'` and, with it, the traffic-collision and road-edge-clamp gates that also key off it, for the rest of the session. Despawn is now gated on `rampState === 'none'` too.
+  - Verified: drive-past without steering onto it never leaves `'none'`; two full ride→launch→land cycles back to back both return cleanly to `'none'` with zero position overlaps; collisions still register in a 20s drive after a ramp passes unused, proving the gates aren't stuck disabled.
+- Production build, all four Sites tests, and a combined headless drive covering every feature together (torque trace, tap vs. hold cannon, 30s traffic drive, HUD screenshot) all pass with an empty browser error log.
+- TODO: none for this request.
+
 ## 2026-08-28 — Review pass: torque, traffic, audio mix, skyline and the neon cannon
 
 Audit of the previous session's stated scope found most of it unimplemented; this pass covers the whole list.

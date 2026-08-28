@@ -307,7 +307,10 @@ const SHOT_COLOR = 0x35f5ff;
 // World units per second, in the player-relative frame the traffic lives in.
 // Slow enough that the bolt is legible for several frames on its way out.
 const SHOT_SPEED = 200;
-const SHOT_COOLDOWN = 0.38;
+// Holding the trigger fires at this fixed cadence. A discrete tap bypasses it
+// entirely and fires immediately — only the 8-slot pool below caps how fast a
+// user can out-click it.
+const SHOT_HOLD_INTERVAL = 0.5;
 const SHOT_MUZZLE_Z = 4.1;
 const SHOT_MAX_Z = 200;
 // Summed half-extents of a bolt and a traffic car, so a bolt that visually
@@ -361,6 +364,37 @@ function createImpactBursts(scene) {
     mesh.visible = false;
     group.add(mesh);
     slots.push({ mesh, active: false, time: 0, scale: 1, seconds: BURST_SECONDS, growth: 5.5 });
+  }
+  scene.add(group);
+  return { group, slots };
+}
+
+// Gold coins scattered along the road. A fixed-size pool scrolls with the
+// world like scenery; collecting one (or letting it pass uncollected) just
+// respawns it further ahead in a random lane, so the road never runs dry.
+const COIN_POOL_SIZE = 10;
+const COIN_MIN_Z = 55;
+const COIN_MAX_Z = 240;
+const COIN_COLLECT_HALF_X = 1.5;
+const COIN_COLLECT_HALF_Z = 1.6;
+
+function createCoins(scene) {
+  const group = new THREE.Group();
+  group.name = 'coins';
+  const geometry = new THREE.CylinderGeometry(0.46, 0.46, 0.11, 22);
+  // Baked into the geometry once so the coin's face points at the camera by
+  // default; the per-frame spin then just animates rotation.y.
+  geometry.rotateX(Math.PI / 2);
+  const material = new THREE.MeshStandardMaterial({
+    color: 0xffd23d, emissive: 0xffae00, emissiveIntensity: 2.4, metalness: 0.78, roughness: 0.26,
+  });
+  const slots = [];
+  for (let i = 0; i < COIN_POOL_SIZE; i += 1) {
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.castShadow = true;
+    addEdges(mesh, 0xfff2c2, 0.55, 12);
+    group.add(mesh);
+    slots.push({ mesh });
   }
   scene.add(group);
   return { group, slots };
@@ -576,7 +610,7 @@ const GRID_LINE_GLOW = 0.0312;
 // past for a given speedometer reading.
 const WORLD_SCALE = 0.44;
 const LANES = [-4.6, -1.55, 1.55, 4.6];
-const MAX_PLAYER_SPEED = 220;
+export const MAX_PLAYER_SPEED = 220;
 // Traffic tops out well below the player. At 98% of our own maximum nothing
 // could ever be caught, so the road ahead was effectively uncollidable.
 const MAX_TRAFFIC_SPEED = MAX_PLAYER_SPEED * 0.78;
@@ -1026,6 +1060,93 @@ function createTaperedSurface(leftRatio = -1, rightRatio = 1, y = 0) {
   return geometry;
 }
 
+// A side ramp: a single-lane strip that peels off the outer lane like a
+// highway exit, climbs, and ends in an upward-angled lip. It never rejoins
+// the road as a driveable surface — reaching the lip launches the car
+// airborne, and it comes back down on the main road under gravity. The
+// player is fixed at world z = 0, so every point along the ramp's own local
+// length `s` (0 at the branch-off, RAMP_LENGTH at the lip) passes under the
+// car exactly once as the ramp's rigid mesh scrolls toward and past it — s
+// for whatever point currently coincides with the player is recovered as
+// `-mesh.position.z`.
+const RAMP_LENGTH = 55;
+// Kept modest on purpose: the chase camera holds a fixed height (a deliberate
+// setting, not a car-follow rig — see AGENTS.md), so a launch has to stay low
+// enough that the car does not fly above the frame it can't chase into.
+const RAMP_PEAK_HEIGHT = 2.4;
+// Higher = the climb stays flatter for longer and steepens only near the
+// lip, which is what gives the exit a "ski jump" rather than a straight
+// incline.
+const RAMP_HEIGHT_EXPONENT = 3;
+const RAMP_LATERAL_OFFSET = 6.5;
+const RAMP_ENTRY_TOLERANCE = 1.3;
+const RAMP_DECK_WIDTH = 3;
+
+function rampProgress(s) {
+  return THREE.MathUtils.clamp(s / RAMP_LENGTH, 0, 1);
+}
+
+// Unsigned lateral offset from the road centreline at local distance `s`;
+// the caller multiplies by the ramp's side (+1/-1) for world x.
+function rampXOffsetAt(s) {
+  const t = rampProgress(s);
+  const eased = t * t * (3 - 2 * t);
+  return THREE.MathUtils.lerp(Math.abs(LANES[LANES.length - 1]), ROAD_HALF_WIDTH + RAMP_LATERAL_OFFSET, eased);
+}
+
+function rampHeightAt(s) {
+  return RAMP_PEAK_HEIGHT * rampProgress(s) ** RAMP_HEIGHT_EXPONENT;
+}
+
+// Derivative of rampHeightAt with respect to s: how steep the deck is at
+// that point, in rise per unit of travel. At s = RAMP_LENGTH this is also
+// what turns the car's own forward speed into a launch vY (see updateRamp).
+function rampSlopeAt(s) {
+  const t = rampProgress(s);
+  return (RAMP_PEAK_HEIGHT * RAMP_HEIGHT_EXPONENT * t ** (RAMP_HEIGHT_EXPONENT - 1)) / RAMP_LENGTH;
+}
+
+// Built once for side = +1; a spawn mirrors it with scale.x = -1 rather than
+// rebuilding the geometry.
+function buildSideRampMesh() {
+  const group = new THREE.Group();
+  group.name = 'side-ramp';
+  const segments = 26;
+  const positions = [];
+  const indices = [];
+  const leftEdge = [];
+  const rightEdge = [];
+  for (let i = 0; i <= segments; i += 1) {
+    const s = (i / segments) * RAMP_LENGTH;
+    const x = rampXOffsetAt(s);
+    const y = rampHeightAt(s);
+    positions.push(x - RAMP_DECK_WIDTH / 2, y, s, x + RAMP_DECK_WIDTH / 2, y, s);
+    leftEdge.push(new THREE.Vector3(x - RAMP_DECK_WIDTH / 2, y + 0.02, s));
+    rightEdge.push(new THREE.Vector3(x + RAMP_DECK_WIDTH / 2, y + 0.02, s));
+    if (i < segments) {
+      const a = i * 2;
+      indices.push(a, a + 1, a + 2, a + 1, a + 3, a + 2);
+    }
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geometry.setIndex(indices);
+  geometry.computeVertexNormals();
+  const deck = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({
+    color: 0x0a0714, roughness: 0.85, metalness: 0.1, side: THREE.DoubleSide,
+  }));
+  deck.castShadow = true;
+  deck.receiveShadow = true;
+  group.add(deck);
+  [leftEdge, rightEdge].forEach((points) => {
+    const edgeGeometry = new THREE.BufferGeometry().setFromPoints(points);
+    const edgeMaterial = new THREE.LineBasicMaterial({ color: BLUE, transparent: true, opacity: 0.95, toneMapped: false });
+    group.add(new THREE.Line(edgeGeometry, edgeMaterial));
+  });
+  group.visible = false;
+  return group;
+}
+
 function createRaceWorld(scene, renderer, camera) {
   const loader = new THREE.TextureLoader();
 
@@ -1138,6 +1259,16 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   scene.add(model.car);
   const shots = createNeonShots(scene);
   const bursts = createImpactBursts(scene);
+  const coins = createCoins(scene);
+  // Staggered ahead in a round-robin of lanes so the pool starts spread out
+  // instead of clumped at one z.
+  coins.slots.forEach((slot, index) => {
+    const lane = LANES[index % LANES.length];
+    const z = COIN_MIN_Z + (index / coins.slots.length) * (COIN_MAX_Z - COIN_MIN_Z) + Math.random() * 8;
+    slot.mesh.position.set(lane, 0.95, z);
+  });
+  const sideRamp = buildSideRampMesh();
+  scene.add(sideRamp);
   const wind = createWind();
   scene.add(wind.lines);
   model.underGlow.material.opacity = 0;
@@ -1224,11 +1355,15 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     { min: 180, max: MAX_SPEED },
   ];
   const GEAR_SECONDS = 1.05;
+  // Torque's rise rate while accelerating is implicitly 1/GEAR_SECONDS (it
+  // tracks speed linearly across a band that takes GEAR_SECONDS to cross).
+  // Braking and coasting decay it at the same rate, so it never falls faster
+  // than it built up.
+  const TORQUE_RATE = 1 / GEAR_SECONDS;
   const SHIFT_SECONDS = 0.42;
   const SHIFT_SPEED_LOSS = 9;
   const LAUNCH_SECONDS = 0.55;
   const LAUNCH_BOOST = 116;
-  const COAST_DECEL = MAX_SPEED / 2;
   const BRAKE_DECEL = 160;
   const REVERSE_ACCEL = 55;
   const LATERAL_SPEED = 9.5;
@@ -1247,9 +1382,12 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   let collisions = 0;
   let laneChanges = 0;
   let wasRunning = false;
-  let shotCooldown = 0;
+  // Counts up toward SHOT_HOLD_INTERVAL while Space is held; a discrete tap
+  // fires immediately and does not wait on this.
+  let spaceAutoFireTimer = 0;
   let shotsFired = 0;
   let shotHits = 0;
+  let coinsCollected = 0;
   let steerDirection = 0;
   const DIFFICULTY_RAMP = 90;
   const TARGET_Z = 5.2;
@@ -1269,6 +1407,21 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   const carRestY = 0.02;
   const wheelRestY = 0.653;
 
+  // Side-ramp jump. 'none': not on it. 'riding': following its curve, x and y
+  // are on rails. 'airborne': just launched off the lip; the suspension state
+  // machine now owns y (as a 'falling' phase) while this only eases x back
+  // toward the road.
+  const RAMP_SPAWN_Z = 175;
+  const RAMP_FIRST_DELAY = 12;
+  const RAMP_INTERVAL_MIN = 24;
+  const RAMP_INTERVAL_MAX = 40;
+  let rampActive = false;
+  let rampSide = 1;
+  let rampState = 'none';
+  let rampSpawnTimer = RAMP_FIRST_DELAY;
+  let rampLandingTargetX = 0;
+  let rampLaunches = 0;
+
   const onKeyDown = (event) => {
     if (event.code === 'KeyF') {
       event.preventDefault();
@@ -1287,13 +1440,23 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     }
     if (event.code === 'Space') {
       event.preventDefault();
-      if (!event.repeat) fireNeonShot();
+      // Each physical press fires once immediately, however fast the user is
+      // clicking. Holding the key down additionally keeps it in `keys`, which
+      // the fixed-cadence auto-fire in updateShots reads every frame.
+      if (!event.repeat) {
+        fireNeonShot();
+        spaceAutoFireTimer = 0;
+      }
+      keys.add(event.code);
       return;
     }
     if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'KeyW', 'KeyA', 'KeyS', 'KeyD'].includes(event.code)) event.preventDefault();
     keys.add(event.code);
   };
-  const onKeyUp = (event) => keys.delete(event.code);
+  const onKeyUp = (event) => {
+    keys.delete(event.code);
+    if (event.code === 'Space') spaceAutoFireTimer = 0;
+  };
   window.addEventListener('keydown', onKeyDown);
   window.addEventListener('keyup', onKeyUp);
 
@@ -1361,12 +1524,18 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
       }
     } else if (braking) {
       speed -= (speed > 0.05 ? BRAKE_DECEL : -REVERSE_ACCEL) * delta;
-      torque = THREE.MathUtils.lerp(torque, 0.2, 1 - Math.exp(-10 * delta));
+      // Torque bleeds off no faster than it built up in the first place.
+      torque = Math.max(0, torque - TORQUE_RATE * delta);
       gearIndex = gearForSpeed(Math.abs(speed));
     } else {
-      const drop = COAST_DECEL * delta;
+      // Off-throttle, the car sheds speed at exactly the rate it would have
+      // gained it in the current gear, so coasting mirrors acceleration
+      // instead of a flat constant that used to decelerate harder than any
+      // gear could accelerate.
+      const gear = GEARS[gearForSpeed(Math.abs(speed))];
+      const drop = ((gear.max - gear.min) / GEAR_SECONDS) * delta;
       speed = drop >= Math.abs(speed) ? 0 : speed - Math.sign(speed) * drop;
-      torque = THREE.MathUtils.lerp(torque, 0, 1 - Math.exp(-9 * delta));
+      torque = Math.max(0, torque - TORQUE_RATE * delta);
       gearIndex = gearForSpeed(Math.abs(speed));
     }
     prevAccelerating = accelerating;
@@ -1386,8 +1555,13 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     // Sideways knocks from a contact ride on top of the steering and decay.
     carX += carVX * delta;
     carVX -= carVX * Math.min(1, LATERAL_DAMPING * delta);
-    carX = THREE.MathUtils.clamp(carX, -(ROAD_HALF_WIDTH - CAR_HALF_WIDTH), ROAD_HALF_WIDTH - CAR_HALF_WIDTH);
-    model.car.position.x = carX;
+    // The side ramp intentionally takes the car outside the road's normal
+    // bounds; updateRamp owns carX for the rest of this frame while riding
+    // or airborne, so the everyday clamp has to stand down.
+    if (rampState === 'none') {
+      carX = THREE.MathUtils.clamp(carX, -(ROAD_HALF_WIDTH - CAR_HALF_WIDTH), ROAD_HALF_WIDTH - CAR_HALF_WIDTH);
+      model.car.position.x = carX;
+    }
     model.car.rotation.z = THREE.MathUtils.lerp(model.car.rotation.z, -steer * 0.045 + carVX * 0.012, 1 - Math.exp(-6 * delta));
     model.car.rotation.y = THREE.MathUtils.lerp(model.car.rotation.y, -steer * 0.16 - carVX * 0.02, 1 - Math.exp(-5 * delta));
     wheelAngle -= delta * (speed * 0.11);
@@ -1417,6 +1591,8 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
         gear,
         torque,
         shifting: shiftTimer > 0,
+        hits: shotHits,
+        coins: coinsCollected,
       });
     }
   }
@@ -1490,7 +1666,9 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   }
 
   function fireNeonShot() {
-    if (!raceRunning || shotCooldown > 0) return;
+    // No cooldown gate: a tap always fires. The pool (8 slots, each bolt
+    // alive under a second at SHOT_SPEED) is the only limit on click rate.
+    if (!raceRunning) return;
     const shot = shots.slots.find((entry) => !entry.active);
     if (!shot) return;
     shot.active = true;
@@ -1498,7 +1676,6 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     shot.z = SHOT_MUZZLE_Z;
     shot.mesh.visible = true;
     shot.mesh.position.set(shot.x, 0.78, shot.z);
-    shotCooldown = SHOT_COOLDOWN;
     shotsFired += 1;
     // Muzzle flash at the nose, so firing reads even when the bolt is already
     // downrange by the next frame. Small and brief — it is right under the lens.
@@ -1507,7 +1684,16 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   }
 
   function updateShots(delta) {
-    shotCooldown = Math.max(0, shotCooldown - delta);
+    // Fixed-cadence auto-fire while the key is held. A tap already fired on
+    // its own keydown and reset this timer, so holding through a tap does not
+    // double up — the next auto-shot still lands a full interval later.
+    if (raceRunning && keys.has('Space')) {
+      spaceAutoFireTimer += delta;
+      if (spaceAutoFireTimer >= SHOT_HOLD_INTERVAL) {
+        fireNeonShot();
+        spaceAutoFireTimer -= SHOT_HOLD_INTERVAL;
+      }
+    }
     const targets = raceWorld.traffic.slots.filter((slot) => slot.active && !slot.launched);
     shots.slots.forEach((shot) => {
       if (!shot.active) return;
@@ -1536,6 +1722,118 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
       }
       shot.mesh.position.z = shot.z;
     });
+  }
+
+  function respawnCoin(slot) {
+    slot.mesh.position.x = LANES[Math.floor(Math.random() * LANES.length)];
+    slot.mesh.position.z = COIN_MIN_Z + Math.random() * (COIN_MAX_Z - COIN_MIN_Z);
+  }
+
+  function updateCoins(delta) {
+    if (!raceRunning) return;
+    coins.slots.forEach((slot) => {
+      slot.mesh.position.z -= travelThisFrame;
+      slot.mesh.rotation.y += delta * 2.6;
+      if (slot.mesh.position.z < -8) {
+        respawnCoin(slot);
+        return;
+      }
+      if (Math.abs(slot.mesh.position.x - carX) < COIN_COLLECT_HALF_X
+        && Math.abs(slot.mesh.position.z) < COIN_COLLECT_HALF_Z) {
+        coinsCollected += 1;
+        carAudio.coin();
+        respawnCoin(slot);
+      }
+    });
+  }
+
+  function spawnRamp() {
+    rampSide = Math.random() < 0.5 ? -1 : 1;
+    sideRamp.scale.x = rampSide;
+    sideRamp.position.z = RAMP_SPAWN_Z;
+    sideRamp.visible = true;
+    rampActive = true;
+    rampState = 'none';
+  }
+
+  function updateRampSpawn(delta) {
+    if (!raceRunning) {
+      if (rampActive) {
+        rampActive = false;
+        sideRamp.visible = false;
+      }
+      rampState = 'none';
+      rampSpawnTimer = RAMP_FIRST_DELAY;
+      return;
+    }
+    if (!rampActive) {
+      rampSpawnTimer -= delta;
+      if (rampSpawnTimer <= 0) spawnRamp();
+      return;
+    }
+    sideRamp.position.z -= travelThisFrame;
+    // Gated on rampState so the mesh never disappears out from under a car
+    // still riding or airborne on it — that would leave updateRamp's guard
+    // clause (`if (!rampActive) return`) skipping the rest of its own state
+    // machine, stranding rampState off 'none' and, with it, the traffic
+    // collision and road-edge clamp it also gates. Once the player is back
+    // to 'none' the mesh is already far behind the camera regardless.
+    if (rampState === 'none' && sideRamp.position.z < -(RAMP_LENGTH + 25)) {
+      rampActive = false;
+      sideRamp.visible = false;
+      rampSpawnTimer = RAMP_INTERVAL_MIN + Math.random() * (RAMP_INTERVAL_MAX - RAMP_INTERVAL_MIN);
+    }
+  }
+
+  // Drives the player through whichever phase the ramp is in. Called after
+  // updateTraffic so its writes to carX/position.x/position.y are the ones
+  // that stick for the frame, overriding the normal driving and collision
+  // logic that ran earlier — both of which are also gated on rampState
+  // elsewhere so they do not fight this.
+  function updateRamp(delta) {
+    if (!rampActive) return;
+    // Local distance along the ramp of whatever point currently sits at the
+    // player's fixed z = 0, recovered from the rigid mesh's own scroll.
+    const s = -sideRamp.position.z;
+
+    if (rampState === 'none' && s >= 0 && s <= RAMP_LENGTH * 0.92) {
+      const entryX = rampSide * rampXOffsetAt(s);
+      if (Math.abs(carX - entryX) < RAMP_ENTRY_TOLERANCE) rampState = 'riding';
+    }
+
+    if (rampState === 'riding') {
+      if (s > RAMP_LENGTH) {
+        // Off the lip: hand y over to the suspension's free-fall integrator,
+        // seeded with an upward velocity so it arcs instead of just dropping.
+        // Converting the ramp's own exit slope this way means a faster car
+        // launches higher, exactly as leaving a real ramp faster would.
+        const worldSpeed = Math.abs(speed) * WORLD_SCALE;
+        suspension.phase = 'falling';
+        // Clamped, not just floored: the raw slope*speed figure comfortably
+        // exceeds what the fixed-height camera can keep framed at highway
+        // speed (see RAMP_PEAK_HEIGHT above), so this is a tuned range, not
+        // a literal launch-angle conversion.
+        suspension.velocity = THREE.MathUtils.clamp(rampSlopeAt(RAMP_LENGTH) * worldSpeed, 5, 7.5);
+        model.car.position.y = carRestY + rampHeightAt(RAMP_LENGTH);
+        rampLandingTargetX = 0;
+        rampState = 'airborne';
+        rampLaunches += 1;
+        carAudio.rampJump();
+      } else {
+        const x = rampSide * rampXOffsetAt(s);
+        carX = x;
+        model.car.position.x = x;
+        model.car.position.y = carRestY + rampHeightAt(s);
+        model.car.rotation.x = -Math.atan(rampSlopeAt(s));
+      }
+    } else if (rampState === 'airborne') {
+      carX = THREE.MathUtils.lerp(carX, rampLandingTargetX, 1 - Math.exp(-2.2 * delta));
+      model.car.position.x = carX;
+      // The suspension machine lands (phase leaves 'falling') on its own;
+      // once it does, the car is physically back on the road and normal
+      // steering/collision resume.
+      if (suspension.phase !== 'falling') rampState = 'none';
+    }
   }
 
   let windEnvelope = 0;
@@ -1807,7 +2105,8 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
       laneChanges = 0;
       shotsFired = 0;
       shotHits = 0;
-      shotCooldown = 0;
+      coinsCollected = 0;
+      spaceAutoFireTimer = 0;
       carVX = 0;
       wasRunning = false;
       return;
@@ -1879,11 +2178,15 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     // because separating one pair can push a car into the next. A few
     // iterations converge without needing a full physics solver.
     for (let pass = 0; pass < 24; pass += 1) if (resolveTrafficContacts(live) === 0) break;
-    resolvePlayerContacts(live);
+    // No traffic collisions while riding or airborne on the side ramp — the
+    // car isn't really sharing the traffic lanes at that point.
+    if (rampState === 'none') resolvePlayerContacts(live);
     for (let pass = 0; pass < 24; pass += 1) if (resolveTrafficContacts(live) === 0) break;
     live.forEach((slot) => { slot.speed = Math.min(slot.speed, MAX_TRAFFIC_SPEED); });
-    carX = THREE.MathUtils.clamp(carX, -(ROAD_HALF_WIDTH - CAR_HALF_WIDTH), ROAD_HALF_WIDTH - CAR_HALF_WIDTH);
-    model.car.position.x = carX;
+    if (rampState === 'none') {
+      carX = THREE.MathUtils.clamp(carX, -(ROAD_HALF_WIDTH - CAR_HALF_WIDTH), ROAD_HALF_WIDTH - CAR_HALF_WIDTH);
+      model.car.position.x = carX;
+    }
   }
 
   // Separates two overlapping bodies along whichever axis they are least buried
@@ -2016,6 +2319,9 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     updateSuspension(delta);
     updateShots(delta);
     updateTraffic(delta);
+    updateRampSpawn(delta);
+    updateRamp(delta);
+    updateCoins(delta);
     updateBursts(delta);
     updateScenery();
     updateCameraRig(delta);
@@ -2113,10 +2419,29 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     },
     neonShots: {
       inFlight: shots.slots.filter((shot) => shot.active).length,
-      cooldown: Number(shotCooldown.toFixed(2)),
+      spaceHeld: keys.has('Space'),
+      autoFireTimer: Number(spaceAutoFireTimer.toFixed(2)),
+      holdInterval: SHOT_HOLD_INTERVAL,
       fired: shotsFired,
       hits: shotHits,
       bursts: bursts.slots.filter((burst) => burst.active).length,
+    },
+    coins: {
+      collected: coinsCollected,
+      pool: coins.slots.length,
+      nearest: coins.slots
+        .map((slot) => ({ x: Number(slot.mesh.position.x.toFixed(2)), z: Number(slot.mesh.position.z.toFixed(1)) }))
+        .sort((a, b) => Math.abs(a.z) - Math.abs(b.z))
+        .slice(0, 3),
+    },
+    sideRamp: {
+      active: rampActive,
+      side: rampSide,
+      state: rampState,
+      s: rampActive ? Number((-sideRamp.position.z).toFixed(1)) : null,
+      length: RAMP_LENGTH,
+      spawnTimer: Number(rampSpawnTimer.toFixed(1)),
+      launches: rampLaunches,
     },
     render: {
       drawCalls: renderer.info.render.calls,
@@ -2218,6 +2543,11 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
       composer.render();
     }
   };
+  // Test-only: skips the normal spawn timer so QA can reach the ramp without
+  // waiting out RAMP_FIRST_DELAY / RAMP_INTERVAL_*.
+  window.debugSpawnRamp = () => {
+    if (!rampActive) spawnRamp();
+  };
 
   return {
     setRunning(enabled) { raceRunning = enabled; },
@@ -2284,6 +2614,7 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
       renderer.domElement.remove();
       delete window.render_game_to_text;
       delete window.advanceTime;
+      delete window.debugSpawnRamp;
     },
   };
 }
