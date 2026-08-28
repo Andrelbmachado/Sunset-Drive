@@ -26,9 +26,14 @@ Build app UI in `src/`. Keep `.openai/hosting.json`, `worker/index.js`, `scripts
 - Keep the latest compact wheel-arch radius (30% smaller outer radius) as the current visual direction, with the inner edge still outside the tire radius.
 - The track is a neon pink grid on a near-black surface: scrolling transverse rungs plus fixed longitudinal rails at the same pitch, so the cells are square. No fill pattern, no centre dash, no edge lines, and nothing on the track is blue.
 - No light runs down the centre of the track.
-- Roadside palms use `public/assets/palm.glb` and must stay almost black. Achieve that with lighting (their own dim render layer), never by overwriting the model's material or texture, so the same asset still reads correctly on a brighter terrain.
+- Roadside palms use `public/assets/palm.glb` and must render as flat black silhouettes. The runtime clone swaps in an unlit black material that keeps only the original map's alpha, so the fronds stay cut out. The GLB on disk is never modified.
 - Skyline buildings use `public/assets/building.glb`, sit far out to the sides to read as distant, stretch between 1x and 3x vertically, and alternate tint colours. They are the only scenery the sunset `DirectionalLight` touches.
 - Traffic populates the road from the moment a race starts and arrives from behind the player as well as ahead. No car may ever spawn within the player's collision band while it is close enough to be unavoidable.
+- Traffic never dodges the player. It queues behind and overtakes other traffic, but avoiding a collision is the driver's job — the car in front must always be reachable. Traffic also tops out well below the player's maximum, so it can be caught.
+- Lane positions, traffic bodies and their collision extents all scale with `taperAt(z)`. A car must stay the same size relative to the road it is on, otherwise the converging far lanes are narrower than the cars and overlap becomes unavoidable.
+- Keys 1-5 select a gear directly and pull speed into that gear's band; space fires the neon cannon. A struck car is thrown into a spinning ballistic arc off the track, clearing the lane.
+- Settings expose music and sound-effect volume on separate buses. The soundtrack is `public/assets/game-sfx.mp3` played through a looping media element; every other effect is synthesised in `src/audio.js`.
+- The start button uses the bundled `Game Over` face (`src/game-over.otf`), white and bold, at 2.5x its original size.
 - Keep car materials free of `transmission`: any non-zero value makes three.js render the whole opaque scene a second time per frame.
 - Cars are impenetrable. Contacts resolve on the axis of least penetration: side-swipes throw both bodies apart laterally, rear-enders hand closing speed forward. Traffic must never spawn on a spot another car already occupies.
 - The sides of the world stay filled with buildings: a detailed GLB ring near the road, and merged box LODs beyond it. Only place columns inside the camera's horizontal cone, otherwise the geometry can never be seen.

@@ -34,6 +34,7 @@ export function App() {
   const [soundOn, setSoundOn] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [camera, setCamera] = useState({ height: 3.15, angle: 0, distance: 10.4 });
+  const [mix, setMix] = useState({ music: 0.5, sfx: 0.72 });
   const [telemetry, setTelemetry] = useState({ speed: 0, rpm: 0, gear: 'N', torque: 0, shifting: false });
 
   useEffect(() => {
@@ -67,6 +68,16 @@ export function App() {
     } catch {
       setSoundOn(false);
     }
+  };
+
+  const updateMusicVolume = (value) => {
+    setMix((previous) => ({ ...previous, music: value }));
+    experienceRef.current?.setMusicVolume(value);
+  };
+
+  const updateSfxVolume = (value) => {
+    setMix((previous) => ({ ...previous, sfx: value }));
+    experienceRef.current?.setSfxVolume(value);
   };
 
   const updateCamera = (patch) => {
@@ -109,7 +120,24 @@ export function App() {
       </div>
 
       {settingsOpen && (
-        <div className="settings-panel" role="group" aria-label="Configurações de câmera">
+        <div className="settings-panel" role="group" aria-label="Configurações">
+          <h2 className="settings-heading">ÁUDIO</h2>
+          <label>
+            <span>MÚSICA<i>{Math.round(mix.music * 100)}%</i></span>
+            <input
+              type="range" min="0" max="1" step="0.01" value={mix.music}
+              onChange={(event) => updateMusicVolume(Number(event.target.value))}
+            />
+          </label>
+          <label>
+            <span>EFEITOS<i>{Math.round(mix.sfx * 100)}%</i></span>
+            <input
+              type="range" min="0" max="1" step="0.01" value={mix.sfx}
+              onChange={(event) => updateSfxVolume(Number(event.target.value))}
+            />
+          </label>
+
+          <h2 className="settings-heading">CÂMERA</h2>
           <label>
             <span>FOCO<i>{camera.distance.toFixed(2)} m</i></span>
             <input
@@ -159,6 +187,9 @@ export function App() {
       {phase === 'menu' && (
         <div className="start-screen">
           <button id="race-start" type="button" onClick={startRace} disabled={!ready}>JOGAR</button>
+          <p className="start-hints">
+            <b>↑↓←→</b> dirigir · <b>1–5</b> marcha · <b>espaço</b> canhão neon · <b>F</b> tela cheia
+          </p>
         </div>
       )}
     </main>

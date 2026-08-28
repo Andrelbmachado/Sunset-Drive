@@ -1,5 +1,26 @@
 Original prompt: gere o threejs desse carro, o mais detalhista possivel.
 
+## 2026-08-28 — Review pass: torque, traffic, audio mix, skyline and the neon cannon
+
+Audit of the previous session's stated scope found most of it unimplemented; this pass covers the whole list.
+
+- Torque now builds twice as fast: `GEAR_SECONDS` halved from 4 to 2 and the launch boost doubled, so a full pull to 220 km/h takes ~10 s instead of ~20 s.
+- Halved the traffic: 20 seeded cars and a 22-car cap, down from 40 and 45; the pool shrank from 64 to 32 slots.
+- Restored the soundtrack. The previous pass deleted the `<audio>` element and left `public/assets/game-sfx.mp3` orphaned, so nothing played. `createCarAudio` now owns a looping media element alongside the synth graph.
+- Settings gained separate MÚSICA and EFEITOS volume sliders on independent buses; verified end to end by driving the sliders and reading the values back out of the audio engine.
+- Buildings now grow on the horizon instead of appearing beside the car. The detailed ring spans 672 units rather than 310, the merged box LODs run to 754, fog thinned from 0.0062 to 0.0034 and the far plane moved from 340 to 900 (with `near` raised to 0.5, which leaves the depth ratio better than before). Palms and rocks were spread over longer rings rather than multiplied, so the extra draw distance cost ~1.5M triangles instead of ~3.7M.
+- Keys 1-5 select a gear directly. Speed is pulled into the chosen band, so 5th from a standstill launches the car at 180 km/h; verified 46 → 181 km/h on a single key press.
+- Palms are now genuinely black: the runtime clone takes an unlit black material that keeps only the source map's alpha, so the fronds stay cut out. Lighting alone had left the baseColor texture showing through.
+- Added a tyre-scrub effect on every fresh flick of the wheel, including a direct left-to-right reversal.
+- **Fixed the car in front being unhittable.** Traffic was actively dodging the player from up to 80 units out and accelerating to a cap set at 98% of the player's own maximum, so nothing ahead could ever be reached. Traffic no longer reacts to the player at all, and its cap dropped to 78%. A 45 s straight-line run at full throttle now produces real collisions where it previously produced none. Spawns are still filtered out of the player's unavoidable band, so nothing is unfair.
+- Added the neon cannon on space: a bolt streaks forward and a struck car is thrown into a spinning ballistic arc off the track, clearing the lane, with a muzzle flash, an impact ring and dedicated sound.
+- The JOGAR button is white, bold, 2.5x its old size and set in the supplied `Game Over` face, bundled at `src/game-over.otf` and preferring a locally installed copy. Measured 555x168 px against the previous 184x67.
+- Fixed a pre-existing geometry conflict the traffic changes exposed: past the road's taper the four lanes converge to ~1.1 units apart while cars stayed 1.9 wide, so overlap was unavoidable however hard the solver worked. Lane positions, bodies and collision extents now all scale with `taperAt(z)`. Real interpenetration across 3600 sampled frames went from 1031 frames (max 4 pairs) to zero.
+- The overlap metric now allows a 0.02-unit contact epsilon: the solver settles resting bodies at exactly their summed half-extents, so a queue of cars bumper to bumper was being counted as interpenetration.
+- Browser verification over several multi-minute runs: no console errors, `carOverlaps` and `playerOverlaps` at zero, 603 draw calls / 4.5M triangles, music playing, all new effects firing.
+- Production build and all four Sites tests pass.
+- TODO: none for this request.
+
 ## 2026-08-27 — Final validation for scenery, traffic and audio pass
 
 - Final prescribed Playwright capture starts with `assetsReady: true`, 40 active cars, zero player-lane intrusions, zero traffic overlaps, zero player overlaps and a running AudioContext.

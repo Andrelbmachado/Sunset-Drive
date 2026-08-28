@@ -300,6 +300,72 @@ function createBackfire() {
   return { group, flames: group.children.filter((child) => child.isMesh && child.geometry.type === 'ConeGeometry'), sparks, light };
 }
 
+// Neon cannon. A bolt is a stretched additive core inside a softer halo, so it
+// reads as a light source without costing a real one, and bloom does the rest.
+const SHOT_POOL_SIZE = 8;
+const SHOT_COLOR = 0x35f5ff;
+// World units per second, in the player-relative frame the traffic lives in.
+// Slow enough that the bolt is legible for several frames on its way out.
+const SHOT_SPEED = 200;
+const SHOT_COOLDOWN = 0.38;
+const SHOT_MUZZLE_Z = 4.1;
+const SHOT_MAX_Z = 200;
+// Summed half-extents of a bolt and a traffic car, so a bolt that visually
+// overlaps a body counts as a strike.
+const SHOT_HIT_HALF_X = 1.35;
+const SHOT_HIT_HALF_Z = 3.4;
+
+function createNeonShots(scene) {
+  const group = new THREE.Group();
+  group.name = 'neon-shots';
+  // Long and thick enough that the bolt reads as an unbroken streak: at full
+  // speed it advances a little over three units a frame, so a shorter tracer
+  // would leave visible gaps between frames.
+  const coreGeometry = new THREE.CylinderGeometry(0.16, 0.16, 7, 10);
+  coreGeometry.rotateX(Math.PI / 2);
+  const haloGeometry = new THREE.CylinderGeometry(0.52, 0.3, 9, 12, 1, true);
+  haloGeometry.rotateX(Math.PI / 2);
+  const coreMaterial = new THREE.MeshBasicMaterial({ color: 0xeaffff, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false });
+  const haloMaterial = new THREE.MeshBasicMaterial({ color: SHOT_COLOR, transparent: true, opacity: 0.5, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false });
+  const slots = [];
+  for (let i = 0; i < SHOT_POOL_SIZE; i += 1) {
+    const bolt = new THREE.Group();
+    bolt.add(new THREE.Mesh(coreGeometry, coreMaterial), new THREE.Mesh(haloGeometry, haloMaterial));
+    bolt.visible = false;
+    group.add(bolt);
+    slots.push({ mesh: bolt, active: false, x: 0, z: 0 });
+  }
+  scene.add(group);
+  return { group, slots };
+}
+
+// Expanding ring left where a bolt connects.
+const BURST_POOL_SIZE = 5;
+const BURST_SECONDS = 0.42;
+
+function createImpactBursts(scene) {
+  const group = new THREE.Group();
+  group.name = 'neon-bursts';
+  const geometry = new THREE.RingGeometry(0.45, 0.72, 24);
+  const slots = [];
+  for (let i = 0; i < BURST_POOL_SIZE; i += 1) {
+    const mesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({
+      color: SHOT_COLOR,
+      transparent: true,
+      opacity: 0,
+      side: THREE.DoubleSide,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      toneMapped: false,
+    }));
+    mesh.visible = false;
+    group.add(mesh);
+    slots.push({ mesh, active: false, time: 0, scale: 1, seconds: BURST_SECONDS, growth: 5.5 });
+  }
+  scene.add(group);
+  return { group, slots };
+}
+
 // White speed streaks that tear past the car once it is pinned at max speed.
 // One LineSegments object, so the whole effect is a single draw call.
 const WIND_STREAKS = 56;
@@ -511,9 +577,11 @@ const GRID_LINE_GLOW = 0.0312;
 const WORLD_SCALE = 0.44;
 const LANES = [-4.6, -1.55, 1.55, 4.6];
 const MAX_PLAYER_SPEED = 220;
-const MAX_TRAFFIC_SPEED = MAX_PLAYER_SPEED * 0.98;
-const TRAFFIC_POOL_SIZE = 64;
-const TRAFFIC_MAX_ACTIVE = 45;
+// Traffic tops out well below the player. At 98% of our own maximum nothing
+// could ever be caught, so the road ahead was effectively uncollidable.
+const MAX_TRAFFIC_SPEED = MAX_PLAYER_SPEED * 0.78;
+const TRAFFIC_POOL_SIZE = 32;
+const TRAFFIC_MAX_ACTIVE = 22;
 // Traffic lives on a z corridor that straddles the chase camera (z = -10.4):
 // cars fade in far ahead, or slip in behind the camera and overtake us.
 const TRAFFIC_SPAWN_Z = 168;
@@ -525,7 +593,7 @@ const TRAFFIC_FORWARD_LIMIT = 230;
 const TRAFFIC_SAFE_ZONE = 60;
 // A hair wider than the 2.4 collision half-width, so a "safe" lane really is.
 const TRAFFIC_LANE_CLEARANCE = 2.6;
-const TRAFFIC_SEED_COUNT = 40;
+const TRAFFIC_SEED_COUNT = 20;
 // Summed half-extents of the two bodies, so an overlap on both axes is a real
 // contact. The player is 2.9 x 7.4, a traffic car 1.9 x 4.2.
 const HIT_HALF_X = 2.4;
@@ -533,6 +601,10 @@ const HIT_HALF_Z = 5.8;
 // Traffic-to-traffic uses two of the smaller body.
 const CAR_HALF_X = 0.95;
 const CAR_HALF_Z = 2.1;
+// The solver settles resting bodies at exactly their summed half-extents, so a
+// queue of cars sitting bumper to bumper lands a few thousandths inside a strict
+// comparison. Only a gap smaller than this counts as real interpenetration.
+const CONTACT_EPSILON = 0.02;
 // How hard a contact throws the bodies apart sideways, and how much closing
 // speed a rear-end hand over along the road.
 const SIDE_IMPULSE = 7.2;
@@ -577,7 +649,13 @@ function createTraffic(scene) {
       targetLane: 0,
       laneChanging: false,
       laneChangeCooldown: 0,
-      evadingPlayer: false,
+      taper: 1,
+      // Set once a neon bolt connects: the car leaves the AI entirely and flies
+      // a ballistic arc off the track instead.
+      launched: false,
+      launchVy: 0,
+      launchVx: 0,
+      spin: new THREE.Vector3(),
     });
   }
   scene.add(group);
@@ -588,8 +666,14 @@ function createTraffic(scene) {
 // far plane. Anything further only ever renders inside solid fog, and these are
 // detailed meshes rather than the boxes they replaced, so the extra instances
 // would be pure cost.
-const PALM_SPACING = 17.5;
+// Spread wider rather than multiplied: the same 44 detailed palms now cover a
+// 528-unit ring, so a recycled palm reappears deep in the fog like the towers do
+// without adding the triangles another 16 clones would cost.
+const PALM_SPACING = 24;
 const PALM_PER_SIDE = 22;
+// How far ahead scenery stays renderable. Everything is recycled inside a ring
+// long enough that the wrap always lands beyond this, deep inside solid fog.
+const SCENERY_FAR_VISIBLE = 780;
 // Deterministic scatter: the scenery must look random but rebuild identically,
 // and seeding off the instance index keeps it dependency-free.
 function scatter(seed) {
@@ -614,23 +698,39 @@ function addScatterBlocks(scene, items, {
     items.push({ mesh, span, kind });
   }
 }
-const BUILDING_SPACING = 31;
-const BUILDING_PER_SIDE = 10;
+// The ring has to be long enough that a recycled building re-enters the world
+// far beyond the fog rather than a few seconds ahead of the bumper. Spacing
+// carries that distance rather than instance count: 16 per side over a 672-unit
+// ring puts a wrapped tower back at z ~ 600, where the fog is still solid, and
+// the merged box LODs behind it keep the skyline from reading as sparse.
+const BUILDING_SPACING = 42;
+const BUILDING_PER_SIDE = 16;
+const BUILDING_START_Z = 60;
 // The GLB is a ~2.2 x 3.25 x 2.2 unit block, so it needs a uniform blow-up
 // before the per-instance vertical stretch turns it into a skyline tower.
 const BUILDING_BASE_SCALE = 4;
 
 function populatePalms(scene, template, items) {
-  // The export ships a fully transmissive material, which would render the
-  // fronds as invisible glass. Zeroing transmission is the only edit made to
-  // it — the baseColor texture stays untouched so the same asset still reads
-  // correctly if it is ever dropped onto a brighter terrain.
+  // The palms are pure black cut-outs. Lighting alone left the baseColor texture
+  // showing through wherever bloom or the environment caught a frond, so the
+  // texture is dropped outright and the material forced to black. The GLB on
+  // disk is untouched — only the runtime clone is retinted.
   template.traverse((node) => {
     if (!node.isMesh) return;
-    if (node.material.transmission !== undefined) node.material.transmission = 0;
-    // Keeps the scene's room environment from lifting the fronds out of
-    // silhouette. The baseColor texture itself is left as authored.
-    node.material.envMapIntensity = 0.012;
+    const source = node.material;
+    // The map is kept only for its alpha, which is what cuts the fronds out of
+    // their quads; black times any texel is still black, so no colour survives.
+    node.material = new THREE.MeshBasicMaterial({
+      color: 0x000000,
+      map: source.map ?? null,
+      alphaMap: source.alphaMap ?? null,
+      transparent: source.transparent,
+      alphaTest: source.alphaTest,
+      side: source.side,
+      toneMapped: false,
+      fog: true,
+    });
+    source.dispose();
   });
 
   const span = PALM_SPACING * PALM_PER_SIDE;
@@ -685,7 +785,7 @@ function populateBuildings(scene, template, items) {
     // Alternating 1x-3x vertical stretch breaks up the skyline silhouette.
     mesh.scale.set(BUILDING_BASE_SCALE, BUILDING_BASE_SCALE * (1 + ((i * 7) % 5) * 0.5), BUILDING_BASE_SCALE);
     mesh.rotation.y = side > 0 ? Math.PI : 0;
-    mesh.position.set(side * (38 + ((i * 5) % 3) * 13), 0, Math.floor(i / 2) * BUILDING_SPACING + 28);
+    mesh.position.set(side * (38 + ((i * 5) % 3) * 13), 0, Math.floor(i / 2) * BUILDING_SPACING + BUILDING_START_Z);
     mesh.castShadow = true;
     mesh.receiveShadow = true;
     mesh.layers.set(SUN_LAYER);
@@ -697,7 +797,7 @@ function populateBuildings(scene, template, items) {
 // Everything past the detailed ring is a box: at this distance the GLB's
 // balconies and railings are sub-pixel, so a stretched cube carries the
 // silhouette for a fraction of the cost and lets the skyline run to the horizon.
-const FAR_BLOCKS = 8;
+const FAR_BLOCKS = 13;
 const FAR_BLOCK_LENGTH = 58;
 const FAR_COLUMNS = [88, 110, 136, 166, 200];
 const FAR_PER_COLUMN = 3;
@@ -750,7 +850,7 @@ function populateDistantSkyline(scene, items) {
 // A dense, shallow bed of closed low-poly stones. Every block is merged into a
 // single draw call, while the closed icosahedra keep the ground convincingly
 // faceted from low chase-camera angles.
-const ROCK_BLOCKS = 7;
+const ROCK_BLOCKS = 10;
 const ROCK_BLOCK_LENGTH = 55;
 const ROCK_PER_BLOCK = 110;
 const ROCK_MIN_X = ROAD_HALF_WIDTH + 0.7;
@@ -890,8 +990,17 @@ function roadHalfWidthAt(z) {
   return THREE.MathUtils.lerp(ROAD_HALF_WIDTH, ROAD_FAR_HALF_WIDTH, t * t * (3 - 2 * t));
 }
 
+// How far the road has narrowed at a given z, as a fraction of its full width.
+// Lane positions, car bodies and their collision extents all ride on this, so a
+// car stays the same size relative to the road it is driving on. Without it the
+// four lanes converge to about 1.1 units apart past the taper while the cars
+// stay 1.9 wide, which makes overlap unavoidable however hard the solver works.
+function taperAt(z) {
+  return roadHalfWidthAt(z) / ROAD_HALF_WIDTH;
+}
+
 function laneXAtZ(lane, z) {
-  return lane * (roadHalfWidthAt(z) / ROAD_HALF_WIDTH);
+  return lane * taperAt(z);
 }
 
 function createTaperedSurface(leftRatio = -1, rightRatio = 1, y = 0) {
@@ -950,12 +1059,14 @@ function createRaceWorld(scene, renderer, camera) {
     scene.add(rail);
   }
 
+  // Wide and long enough to stay under the deepened skyline, so the ground never
+  // ends before the fog does.
   const shoulder = new THREE.Mesh(
-    new THREE.PlaneGeometry(220, 420),
+    new THREE.PlaneGeometry(620, 940),
     new THREE.MeshBasicMaterial({ color: 0x090117 }),
   );
   shoulder.rotation.x = -Math.PI / 2;
-  shoulder.position.set(0, -0.012, 120);
+  shoulder.position.set(0, -0.012, 360);
   scene.add(shoulder);
 
   const skyMaterial = new THREE.MeshBasicMaterial({ depthWrite: false, depthTest: false, fog: false, side: THREE.DoubleSide, toneMapped: false });
@@ -994,8 +1105,12 @@ function createRaceWorld(scene, renderer, camera) {
 export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x0b0528);
-  scene.fog = new THREE.FogExp2(0x120526, 0.0062);
-  const camera = new THREE.PerspectiveCamera(42, container.clientWidth / container.clientHeight, 0.1, 340);
+  // Thinner fog and a much deeper far plane: the skyline has to read from
+  // hundreds of units out so towers grow on the horizon instead of appearing
+  // alongside the car. Raising `near` in step keeps the depth ratio better than
+  // it was before the far plane moved.
+  scene.fog = new THREE.FogExp2(0x120526, 0.0034);
+  const camera = new THREE.PerspectiveCamera(42, container.clientWidth / container.clientHeight, 0.5, 900);
   camera.position.set(0, 3.15, -10.4);
   camera.layers.enable(SUN_LAYER);
   camera.layers.enable(PALM_LAYER);
@@ -1018,9 +1133,11 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   controls.enabled = false;
 
   const raceWorld = createRaceWorld(scene, renderer, camera);
-  const carAudio = createCarAudio();
+  const carAudio = createCarAudio({ musicUrl: `${ASSET_BASE}assets/game-sfx.mp3` });
   const model = createCar();
   scene.add(model.car);
+  const shots = createNeonShots(scene);
+  const bursts = createImpactBursts(scene);
   const wind = createWind();
   scene.add(wind.lines);
   model.underGlow.material.opacity = 0;
@@ -1095,7 +1212,7 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   const MAX_SPEED = MAX_PLAYER_SPEED;
   const MAX_REVERSE = -55;
   // Five gears, each covering its own speed band in roughly GEAR_SECONDS of
-  // throttle, so a full pull from a standstill to MAX_SPEED takes ~20 s.
+  // throttle, so a full pull from a standstill to MAX_SPEED takes ~10 s.
   const GEARS = [
     { min: 0, max: 55 },
     { min: 55, max: 100 },
@@ -1103,11 +1220,12 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     { min: 140, max: 180 },
     { min: 180, max: MAX_SPEED },
   ];
-  const GEAR_SECONDS = 4;
+  // Halved, so torque builds — and therefore speed climbs — at twice the old rate.
+  const GEAR_SECONDS = 2;
   const SHIFT_SECONDS = 0.42;
   const SHIFT_SPEED_LOSS = 9;
   const LAUNCH_SECONDS = 0.55;
-  const LAUNCH_BOOST = 58;
+  const LAUNCH_BOOST = 116;
   const COAST_DECEL = MAX_SPEED / 2;
   const BRAKE_DECEL = 160;
   const REVERSE_ACCEL = 55;
@@ -1127,6 +1245,10 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   let collisions = 0;
   let laneChanges = 0;
   let wasRunning = false;
+  let shotCooldown = 0;
+  let shotsFired = 0;
+  let shotHits = 0;
+  let steerDirection = 0;
   const DIFFICULTY_RAMP = 90;
   const TARGET_Z = 5.2;
   let cameraHeight = 3.15;
@@ -1152,6 +1274,20 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
       else container.requestFullscreen?.();
       return;
     }
+    // 1-5 drop the car straight into that gear. Selecting a higher gear pulls
+    // speed up to the bottom of its band, which is what makes a standing start
+    // in 4th or 5th immediately quick.
+    const gearKey = /^(Digit|Numpad)([1-5])$/.exec(event.code);
+    if (gearKey) {
+      event.preventDefault();
+      selectGear(Number(gearKey[2]) - 1);
+      return;
+    }
+    if (event.code === 'Space') {
+      event.preventDefault();
+      if (!event.repeat) fireNeonShot();
+      return;
+    }
     if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'KeyW', 'KeyA', 'KeyS', 'KeyD'].includes(event.code)) event.preventDefault();
     keys.add(event.code);
   };
@@ -1162,6 +1298,25 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   function gearForSpeed(value) {
     for (let i = GEARS.length - 1; i >= 0; i -= 1) if (value >= GEARS[i].min) return i;
     return 0;
+  }
+
+  // Manual gear select. Speed is pulled into the chosen gear's band, so picking
+  // a high gear from a standstill launches the car at that speed — the point of
+  // the shortcut — and picking a low one engine-brakes down into it. Without the
+  // clamp the automatic would simply reselect the gear that matched the speed
+  // and the key press would do nothing.
+  function selectGear(index) {
+    if (!raceRunning || index < 0 || index >= GEARS.length) return;
+    const target = GEARS[index];
+    gearIndex = index;
+    shiftTimer = SHIFT_SECONDS * 0.5;
+    if (speed < target.min) {
+      speed = target.min;
+      backfireTime = backfireDuration;
+    } else if (speed > target.max) {
+      speed = target.max;
+    }
+    torque = THREE.MathUtils.clamp((speed - target.min) / (target.max - target.min), 0, 1);
   }
 
   function updateDriving(delta, elapsed) {
@@ -1220,6 +1375,9 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     // Screen-right is world -x from the chase camera, so lateral motion and the
     // nose yaw both invert the raw steer input.
     const steerTarget = steeringLeft ? -1 : steeringRight ? 1 : 0;
+    // Raw input, not the smoothed value: the scrub effect should fire the moment
+    // the wheel is flicked, including on a direct left-to-right reversal.
+    steerDirection = raceRunning ? steerTarget : 0;
     steer = THREE.MathUtils.lerp(steer, steerTarget, 1 - Math.exp(-8 * delta));
     const steerAuthority = THREE.MathUtils.clamp(Math.abs(speed) / 26, 0.22, 1);
     carX -= steer * LATERAL_SPEED * steerAuthority * delta;
@@ -1259,6 +1417,123 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
         shifting: shiftTimer > 0,
       });
     }
+  }
+
+  // `scale` matters because the same ring is used at both ends of the shot: the
+  // muzzle sits barely 14 units from the camera, where an impact-sized ring
+  // would swallow the screen, while a strike is usually a hundred units out.
+  function spawnBurst(x, y, z, { scale = 1, seconds = BURST_SECONDS, growth = 5.5 } = {}) {
+    const burst = bursts.slots.find((entry) => !entry.active) ?? bursts.slots[0];
+    burst.active = true;
+    burst.time = 0;
+    burst.scale = scale;
+    burst.seconds = seconds;
+    burst.growth = growth;
+    burst.mesh.visible = true;
+    burst.mesh.position.set(x, y, z);
+    burst.mesh.scale.setScalar(scale);
+    burst.mesh.material.opacity = 1;
+  }
+
+  function updateBursts(delta) {
+    bursts.slots.forEach((burst) => {
+      if (!burst.active) return;
+      burst.time += delta;
+      const t = burst.time / burst.seconds;
+      if (t >= 1) {
+        burst.active = false;
+        burst.mesh.visible = false;
+        return;
+      }
+      burst.mesh.scale.setScalar(burst.scale * (1 + t * burst.growth));
+      burst.mesh.material.opacity = (1 - t) * 0.95;
+      burst.mesh.lookAt(camera.position);
+    });
+  }
+
+  // A struck car is thrown up, spun on all three axes and pushed toward the
+  // nearest verge, which is what clears the lane the player was blocked in.
+  function launchTrafficCar(slot, impactZ) {
+    slot.launched = true;
+    slot.laneChanging = false;
+    slot.launchVy = 15.5 + Math.random() * 4;
+    // Away from the road centre, so the wreck always leaves the track.
+    const outward = Math.sign(slot.x) || (Math.random() < 0.5 ? -1 : 1);
+    slot.launchVx = outward * (9 + Math.random() * 7);
+    slot.spin.set(
+      6 + Math.random() * 5,
+      outward * (3.5 + Math.random() * 3),
+      outward * (7 + Math.random() * 5),
+    );
+    slot.speed = Math.max(slot.speed, 40);
+    slot.mesh.material.emissiveIntensity = 5.5;
+    spawnBurst(slot.x, 0.9, impactZ);
+    carAudio.launchHit();
+    shotHits += 1;
+  }
+
+  function updateLaunchedCar(slot, delta) {
+    slot.launchVy -= 21 * delta;
+    slot.mesh.position.y += slot.launchVy * delta;
+    slot.x += slot.launchVx * delta;
+    slot.mesh.position.x = slot.x;
+    slot.mesh.rotation.x += slot.spin.x * delta;
+    slot.mesh.rotation.y += slot.spin.y * delta;
+    slot.mesh.rotation.z += slot.spin.z * delta;
+    slot.mesh.material.emissiveIntensity = Math.max(0.45, slot.mesh.material.emissiveIntensity - delta * 3.4);
+    if (slot.mesh.position.y < -9) {
+      slot.active = false;
+      slot.mesh.visible = false;
+    }
+  }
+
+  function fireNeonShot() {
+    if (!raceRunning || shotCooldown > 0) return;
+    const shot = shots.slots.find((entry) => !entry.active);
+    if (!shot) return;
+    shot.active = true;
+    shot.x = carX;
+    shot.z = SHOT_MUZZLE_Z;
+    shot.mesh.visible = true;
+    shot.mesh.position.set(shot.x, 0.78, shot.z);
+    shotCooldown = SHOT_COOLDOWN;
+    shotsFired += 1;
+    // Muzzle flash at the nose, so firing reads even when the bolt is already
+    // downrange by the next frame. Small and brief — it is right under the lens.
+    spawnBurst(carX, 0.78, SHOT_MUZZLE_Z, { scale: 0.3, seconds: 0.16, growth: 2.4 });
+    carAudio.shot();
+  }
+
+  function updateShots(delta) {
+    shotCooldown = Math.max(0, shotCooldown - delta);
+    const targets = raceWorld.traffic.slots.filter((slot) => slot.active && !slot.launched);
+    shots.slots.forEach((shot) => {
+      if (!shot.active) return;
+      shot.z += SHOT_SPEED * delta;
+      if (shot.z > SHOT_MAX_Z) {
+        shot.active = false;
+        shot.mesh.visible = false;
+        return;
+      }
+      // Nearest overlapping car along the flight path, so a bolt cannot skip
+      // past the first car in a queue and hit the one behind it.
+      let struck = null;
+      for (const slot of targets) {
+        // Re-checked per bolt: an earlier bolt this same frame may already have
+        // launched this car.
+        if (slot.launched || !slot.active) continue;
+        if (Math.abs(slot.x - shot.x) > SHOT_HIT_HALF_X) continue;
+        if (Math.abs(slot.mesh.position.z - shot.z) > SHOT_HIT_HALF_Z) continue;
+        if (!struck || slot.mesh.position.z < struck.mesh.position.z) struck = slot;
+      }
+      if (struck) {
+        launchTrafficCar(struck, shot.z);
+        shot.active = false;
+        shot.mesh.visible = false;
+        return;
+      }
+      shot.mesh.position.z = shot.z;
+    });
   }
 
   let windEnvelope = 0;
@@ -1377,17 +1652,19 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   // is already there — the solver would otherwise have to shove them apart in
   // full view.
   function spotIsFree(x, z) {
+    const taper = taperAt(z);
     return !raceWorld.traffic.slots.some((slot) => slot.active
-      && Math.abs(slot.x - x) < CAR_HALF_X * 2.4
-      && Math.abs(slot.mesh.position.z - z) < CAR_HALF_Z * 2.4);
+      && !slot.launched
+      && Math.abs(slot.x - x) < CAR_HALF_X * 2.4 * taper
+      && Math.abs(slot.mesh.position.z - z) < CAR_HALF_Z * 2.4 * taper);
   }
 
   function trafficCruiseSpeed(fromBehind, level) {
     const roll = Math.random();
     let cruiseSpeed;
-    if (roll < 0.3) cruiseSpeed = 52 + Math.random() * 48;
-    else if (roll < 0.78) cruiseSpeed = 102 + Math.random() * 64;
-    else cruiseSpeed = 168 + Math.random() * (MAX_TRAFFIC_SPEED - 168);
+    if (roll < 0.3) cruiseSpeed = 52 + Math.random() * 40;
+    else if (roll < 0.78) cruiseSpeed = 92 + Math.random() * 48;
+    else cruiseSpeed = 140 + Math.random() * (MAX_TRAFFIC_SPEED - 140);
     if (fromBehind) cruiseSpeed = Math.max(cruiseSpeed, speed + THREE.MathUtils.lerp(18, 42, level) + Math.random() * 18);
     return THREE.MathUtils.clamp(cruiseSpeed, 45, MAX_TRAFFIC_SPEED);
   }
@@ -1422,23 +1699,33 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     slot.targetLane = lane;
     slot.laneChanging = false;
     slot.laneChangeCooldown = Math.random() * 1.2;
-    slot.evadingPlayer = false;
+    slot.launched = false;
+    slot.launchVy = 0;
+    slot.launchVx = 0;
+    slot.spin.set(0, 0, 0);
+    slot.taper = taperAt(spawnZ);
     slot.mesh.visible = true;
-    slot.mesh.position.set(slot.x, 0.68, spawnZ);
+    slot.mesh.rotation.set(0, 0, 0);
+    slot.mesh.scale.setScalar(slot.taper);
+    slot.mesh.position.set(slot.x, 0.68 * slot.taper, spawnZ);
     slot.mesh.material.emissiveIntensity = 0.45;
     return true;
   }
 
-  // Eight cars begin behind the camera and thirty-two ahead, all outside the
+  // Four cars begin behind the camera and sixteen ahead, all outside the
   // player's unavoidable collision band. Cars are staggered longitudinally so
   // the four visual lanes can converge safely as they approach the horizon.
+  const SEED_BEHIND_COUNT = 4;
+
   function seedTraffic() {
     for (let i = 0; i < TRAFFIC_SEED_COUNT; i += 1) {
-      const behind = i < 8;
+      const behind = i < SEED_BEHIND_COUNT;
       const z = behind
-        ? TRAFFIC_BEHIND_Z - 30 + i * 5.8
-        : 46 + (i - 8) * 5.25;
-      const lane = behind ? (i % 2 ? LANES[LANES.length - 1] : LANES[0]) : LANES[(i - 8) % LANES.length];
+        ? TRAFFIC_BEHIND_Z - 30 + i * 11.6
+        : 46 + (i - SEED_BEHIND_COUNT) * 10.5;
+      const lane = behind
+        ? (i % 2 ? LANES[LANES.length - 1] : LANES[0])
+        : LANES[(i - SEED_BEHIND_COUNT) % LANES.length];
       spawnTrafficCar({ fromBehind: behind, forcedZ: z, forcedLane: lane });
     }
     spawnTimer = 1.5;
@@ -1446,14 +1733,14 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
 
   function laneClearance(slot, lane, live) {
     const candidateX = laneXAtZ(lane, slot.mesh.position.z);
-    if (Math.abs(candidateX) > roadHalfWidthAt(slot.mesh.position.z) - CAR_HALF_X) return -Infinity;
+    if (Math.abs(candidateX) > roadHalfWidthAt(slot.mesh.position.z) - CAR_HALF_X * slot.taper) return -Infinity;
     if (slot.mesh.position.z < TRAFFIC_SAFE_ZONE && Math.abs(candidateX - carX) <= TRAFFIC_LANE_CLEARANCE) return -Infinity;
     let nearest = Infinity;
     for (const other of live) {
       if (other === slot) continue;
       const dz = other.mesh.position.z - slot.mesh.position.z;
       const otherTargetX = laneXAtZ(other.targetLane, other.mesh.position.z);
-      if (Math.abs(otherTargetX - candidateX) < CAR_HALF_X * 2.25
+      if (Math.abs(otherTargetX - candidateX) < CAR_HALF_X * (slot.taper + other.taper) * 1.125
         && dz > -LANE_CLEAR_BEHIND && dz < LANE_CLEAR_AHEAD) return -Infinity;
       nearest = Math.min(nearest, Math.abs(dz));
     }
@@ -1461,40 +1748,11 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   }
 
   function planTrafficMotion(slot, live) {
-    slot.evadingPlayer = false;
-    // A fast player closing from behind is also a predicted collision. Traffic
-    // in either centre lane opens outward before the player reaches its body.
-    const playerGap = slot.mesh.position.z - HIT_HALF_Z;
-    const playerClosing = speed - slot.speed;
-    const playerTimeToContact = playerClosing > 0.5 ? playerGap / (playerClosing * WORLD_SCALE) : Infinity;
-    const playerThreatened = playerGap > 0
-      && Math.abs(slot.x - carX) < HIT_HALF_X
-      && (playerGap < 14 || (playerGap < 80 && playerTimeToContact < 5));
-    if (playerThreatened && !slot.laneChanging && slot.laneChangeCooldown <= 0) {
-      slot.evadingPlayer = true;
-      const laneIndex = LANES.indexOf(slot.lane);
-      const escapeLanes = [LANES[laneIndex - 1], LANES[laneIndex + 1]]
-        .filter((lane) => lane !== undefined && Math.abs(laneXAtZ(lane, slot.mesh.position.z) - carX) > HIT_HALF_X)
-        .map((lane) => ({ lane, clearance: laneClearance(slot, lane, live) }))
-        .filter((candidate) => Number.isFinite(candidate.clearance))
-        .sort((a, b) => b.clearance - a.clearance);
-      if (escapeLanes.length) {
-        slot.targetLane = escapeLanes[0].lane;
-        slot.laneChanging = true;
-        slot.laneChangeCooldown = LANE_CHANGE_COOLDOWN + Math.random() * 1.4;
-        laneChanges += 1;
-        return slot.cruiseSpeed;
-      }
-      // Dense traffic can temporarily block both adjacent lanes. Accelerating
-      // up to the traffic cap opens longitudinal space without crossing into
-      // the player's path.
-      return MAX_TRAFFIC_SPEED;
-    }
-    if (playerThreatened) {
-      slot.evadingPlayer = true;
-      return MAX_TRAFFIC_SPEED;
-    }
-
+    // Traffic drives its own road: it queues behind slower cars and changes lane
+    // around them, but it never reacts to the player. Dodging us — which it used
+    // to do from 80 units out, at full traffic speed — made the car in front
+    // impossible to reach, so avoiding it is the driver's job now. Spawns are
+    // still filtered out of the player's unavoidable band, so nothing is unfair.
     let lead = null;
     let leadGap = Infinity;
     for (const other of live) {
@@ -1538,11 +1796,16 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   function updateTraffic(delta) {
     const { slots } = raceWorld.traffic;
     if (!raceRunning) {
-      slots.forEach((slot) => { slot.active = false; slot.mesh.visible = false; });
+      slots.forEach((slot) => { slot.active = false; slot.launched = false; slot.mesh.visible = false; });
+      shots.slots.forEach((shot) => { shot.active = false; shot.mesh.visible = false; });
+      bursts.slots.forEach((burst) => { burst.active = false; burst.mesh.visible = false; });
       raceTime = 0;
       spawnTimer = 0;
       collisions = 0;
       laneChanges = 0;
+      shotsFired = 0;
+      shotHits = 0;
+      shotCooldown = 0;
       carVX = 0;
       wasRunning = false;
       return;
@@ -1573,6 +1836,10 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
         slot.mesh.visible = false;
         return;
       }
+      if (slot.launched) {
+        updateLaunchedCar(slot, delta);
+        return;
+      }
       if (slot.hit) slot.mesh.material.emissiveIntensity = Math.max(0.45, slot.mesh.material.emissiveIntensity - delta * 4);
       slot.laneChangeCooldown = Math.max(0, slot.laneChangeCooldown - delta);
       live.push(slot);
@@ -1580,7 +1847,7 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
 
     live.forEach((slot) => {
       const desiredSpeed = planTrafficMotion(slot, live);
-      const speedResponse = desiredSpeed < slot.speed || slot.evadingPlayer ? 4.8 : 0.85;
+      const speedResponse = desiredSpeed < slot.speed ? 4.8 : 0.85;
       slot.speed = THREE.MathUtils.clamp(
         THREE.MathUtils.lerp(slot.speed, desiredSpeed, 1 - Math.exp(-speedResponse * delta)),
         35,
@@ -1596,7 +1863,10 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
         slot.lane = slot.targetLane;
         slot.laneChanging = false;
       }
-      const roadLimit = Math.max(0, roadHalfWidthAt(slot.mesh.position.z) - CAR_HALF_X);
+      slot.taper = taperAt(slot.mesh.position.z);
+      slot.mesh.scale.setScalar(slot.taper);
+      slot.mesh.position.y = 0.68 * slot.taper;
+      const roadLimit = Math.max(0, roadHalfWidthAt(slot.mesh.position.z) - CAR_HALF_X * slot.taper);
       slot.x = THREE.MathUtils.clamp(slot.x, -roadLimit, roadLimit);
       slot.mesh.position.x = slot.x;
       const lateralVelocity = laneStep / Math.max(delta, 0.001) + slot.vx;
@@ -1632,7 +1902,10 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
       for (let j = i + 1; j < live.length; j += 1) {
         const a = live[i];
         const b = live[j];
-        const hit = contact(b.x - a.x, b.mesh.position.z - a.mesh.position.z, CAR_HALF_X * 2, CAR_HALF_Z * 2);
+        // Summed half-extents of this particular pair, each shrunk by the road
+        // width where it sits.
+        const spread = a.taper + b.taper;
+        const hit = contact(b.x - a.x, b.mesh.position.z - a.mesh.position.z, CAR_HALF_X * spread, CAR_HALF_Z * spread);
         if (!hit) continue;
         if (hit.sideways) {
           // Push both clear and send them apart sideways.
@@ -1713,7 +1986,7 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
       // becomes renderable again when it re-enters the forward corridor.
       if (item.mesh.position.z < -72) item.mesh.position.z += item.span;
       else if (item.mesh.position.z > item.span + 40) item.mesh.position.z -= item.span;
-      item.mesh.visible = item.mesh.position.z > -62 && item.mesh.position.z < ROAD_FAR_Z + 18;
+      item.mesh.visible = item.mesh.position.z > -62 && item.mesh.position.z < SCENERY_FAR_VISIBLE;
     });
   }
 
@@ -1733,12 +2006,15 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
       braking: isBraking,
       shifting: shiftTimer > 0,
       maxed,
+      steerDirection,
     });
     updateWind(delta, maxed);
     updateBackfire(delta, elapsed, maxed);
     updateTurnSignals(delta);
     updateSuspension(delta);
+    updateShots(delta);
     updateTraffic(delta);
+    updateBursts(delta);
     updateScenery();
     updateCameraRig(delta);
     if (impactFlash > 0) {
@@ -1831,6 +2107,14 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
       maxActive: TRAFFIC_MAX_ACTIVE,
       raceTime: Number(raceTime.toFixed(1)),
       collisions,
+      launched: raceWorld.traffic.slots.filter((slot) => slot.active && slot.launched).length,
+    },
+    neonShots: {
+      inFlight: shots.slots.filter((shot) => shot.active).length,
+      cooldown: Number(shotCooldown.toFixed(2)),
+      fired: shotsFired,
+      hits: shotHits,
+      bursts: bursts.slots.filter((burst) => burst.active).length,
     },
     render: {
       drawCalls: renderer.info.render.calls,
@@ -1840,15 +2124,40 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
       // Any pair still interpenetrating after a resolve pass is a solver
       // failure: bodies are supposed to be impenetrable.
       carOverlaps: (() => {
-        const live = raceWorld.traffic.slots.filter((slot) => slot.active);
+        // Launched wrecks are excluded: they are metres above the road, so an
+        // x/z overlap with a car still driving is not a contact.
+        const live = raceWorld.traffic.slots.filter((slot) => slot.active && !slot.launched);
         let count = 0;
         for (let i = 0; i < live.length; i += 1) {
           for (let j = i + 1; j < live.length; j += 1) {
-            if (Math.abs(live[i].x - live[j].x) < CAR_HALF_X * 2
-              && Math.abs(live[i].mesh.position.z - live[j].mesh.position.z) < CAR_HALF_Z * 2) count += 1;
+            const spread = live[i].taper + live[j].taper;
+            if (Math.abs(live[i].x - live[j].x) < CAR_HALF_X * spread - CONTACT_EPSILON
+              && Math.abs(live[i].mesh.position.z - live[j].mesh.position.z) < CAR_HALF_Z * spread - CONTACT_EPSILON) count += 1;
           }
         }
         return count;
+      })(),
+      // Where any residual overlap is, so a solver failure can be told from a
+      // pair converging in the distance.
+      carOverlapPairs: (() => {
+        const live = raceWorld.traffic.slots.filter((slot) => slot.active && !slot.launched);
+        const pairs = [];
+        for (let i = 0; i < live.length; i += 1) {
+          for (let j = i + 1; j < live.length; j += 1) {
+            const spread = live[i].taper + live[j].taper;
+            const dx = Math.abs(live[i].x - live[j].x);
+            const dz = Math.abs(live[i].mesh.position.z - live[j].mesh.position.z);
+            if (dx < CAR_HALF_X * spread - CONTACT_EPSILON && dz < CAR_HALF_Z * spread - CONTACT_EPSILON) {
+              pairs.push({
+                z: [Number(live[i].mesh.position.z.toFixed(1)), Number(live[j].mesh.position.z.toFixed(1))],
+                dx: Number(dx.toFixed(2)),
+                dz: Number(dz.toFixed(2)),
+                taper: [Number(live[i].taper.toFixed(2)), Number(live[j].taper.toFixed(2))],
+              });
+            }
+          }
+        }
+        return pairs;
       })(),
       playerOverlaps: raceWorld.traffic.slots.filter((slot) => slot.active
         && Math.abs(slot.x - carX) < HIT_HALF_X && Math.abs(slot.mesh.position.z) < HIT_HALF_Z).length,
@@ -1911,6 +2220,10 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   return {
     setRunning(enabled) { raceRunning = enabled; },
     setSoundEnabled(enabled) { return carAudio.setEnabled(enabled); },
+    setMusicVolume(value) { return carAudio.setMusicVolume(value); },
+    setSfxVolume(value) { return carAudio.setSfxVolume(value); },
+    selectGear(index) { selectGear(index); },
+    fireNeonShot() { fireNeonShot(); },
     setCameraRig({ height, angle, distance }) {
       if (typeof height === 'number') cameraHeight = THREE.MathUtils.clamp(height, 1.4, 9);
       if (typeof angle === 'number') cameraAngle = THREE.MathUtils.clamp(angle, -2, 30);
