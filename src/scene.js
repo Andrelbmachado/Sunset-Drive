@@ -683,6 +683,10 @@ function createTraffic(scene) {
       targetLane: 0,
       laneChanging: false,
       laneChangeCooldown: 0,
+      // How long this car has been blocked with nowhere to go. A long enough
+      // wait eases how tight a gap it will accept, so a jam can't pin a car
+      // in place forever — see planTrafficMotion / laneClearance.
+      stuckTime: 0,
       taper: 1,
       // Set once a neon bolt connects: the car leaves the AI entirely and flies
       // a ballistic arc off the track instead.
@@ -1147,6 +1151,77 @@ function buildSideRampMesh() {
   return group;
 }
 
+// Roadside warning sign for the ramp: a canvas-texture board (real road-sign
+// yellow/black diagonal stripe, so it reads as "hazard ahead" at a glance)
+// plus a neon-blue arrow matching the ramp's own edge colour, on a post at
+// the shoulder. Two are placed at different lead distances ahead of the
+// ramp's entry — see RAMP_SIGN_LEAD_FAR/NEAR — so the player gets an early
+// warning and a closer confirmation.
+function createRampSignTexture() {
+  const canvas = document.createElement('canvas');
+  canvas.width = 256;
+  canvas.height = 256;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#0a0a0a';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(10, 10, canvas.width - 20, canvas.height - 20);
+  ctx.clip();
+  ctx.strokeStyle = '#ffcf1a';
+  ctx.lineWidth = 26;
+  for (let x = -canvas.height; x < canvas.width + canvas.height; x += 44) {
+    ctx.beginPath();
+    ctx.moveTo(x, canvas.height);
+    ctx.lineTo(x + canvas.height, 0);
+    ctx.stroke();
+  }
+  ctx.restore();
+  ctx.strokeStyle = '#050505';
+  ctx.lineWidth = 10;
+  ctx.strokeRect(10, 10, canvas.width - 20, canvas.height - 20);
+  // Upward ramp arrow.
+  ctx.strokeStyle = '#35f5ff';
+  ctx.lineWidth = 16;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.shadowColor = '#35f5ff';
+  ctx.shadowBlur = 18;
+  ctx.beginPath();
+  ctx.moveTo(60, 200);
+  ctx.lineTo(150, 200);
+  ctx.lineTo(150, 110);
+  ctx.lineTo(196, 110);
+  ctx.lineTo(130, 44);
+  ctx.lineTo(64, 110);
+  ctx.lineTo(110, 110);
+  ctx.lineTo(110, 160);
+  ctx.stroke();
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  return texture;
+}
+
+function buildRampSign() {
+  const group = new THREE.Group();
+  group.name = 'ramp-sign';
+  const post = new THREE.Mesh(
+    new THREE.BoxGeometry(0.14, 2.3, 0.14),
+    new THREE.MeshStandardMaterial({ color: 0x0c0c10, roughness: 0.6, metalness: 0.3 }),
+  );
+  post.position.y = 1.15;
+  post.castShadow = true;
+  group.add(post);
+  const board = new THREE.Mesh(
+    new THREE.PlaneGeometry(1.5, 1.5),
+    new THREE.MeshBasicMaterial({ map: createRampSignTexture(), toneMapped: false, side: THREE.DoubleSide }),
+  );
+  board.position.set(0, 2.15, 0);
+  group.add(board);
+  group.visible = false;
+  return group;
+}
+
 function createRaceWorld(scene, renderer, camera) {
   const loader = new THREE.TextureLoader();
 
@@ -1229,8 +1304,13 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   // Thinner fog and a much deeper far plane: the skyline has to read from
   // hundreds of units out so towers grow on the horizon instead of appearing
   // alongside the car. Raising `near` in step keeps the depth ratio better than
-  // it was before the far plane moved.
-  scene.fog = new THREE.FogExp2(0x120526, 0.0034);
+  // it was before the far plane moved. Thinned further still: at 0.0034
+  // buildings stayed under 6% visible past z=500 and only really emerged from
+  // z~400, which read as popping out of nowhere. At 0.0022 they're ~30%
+  // visible (a soft, growing silhouette) by z=500 and ~65% by z=300, while the
+  // far LOD skyline's own edge (~z=790) is still faint enough (~5%) that its
+  // hard visibility cutoff never reads as a pop.
+  scene.fog = new THREE.FogExp2(0x120526, 0.0022);
   const camera = new THREE.PerspectiveCamera(42, container.clientWidth / container.clientHeight, 0.5, 900);
   camera.position.set(0, 3.15, -10.4);
   camera.layers.enable(SUN_LAYER);
@@ -1269,6 +1349,9 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   });
   const sideRamp = buildSideRampMesh();
   scene.add(sideRamp);
+  const rampSignFar = buildRampSign();
+  const rampSignNear = buildRampSign();
+  scene.add(rampSignFar, rampSignNear);
   const wind = createWind();
   scene.add(wind.lines);
   model.underGlow.material.opacity = 0;
@@ -1415,6 +1498,11 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   const RAMP_FIRST_DELAY = 12;
   const RAMP_INTERVAL_MIN = 24;
   const RAMP_INTERVAL_MAX = 40;
+  // Constant lead ahead of the ramp's own entry point, in world units — since
+  // both the sign and the ramp scroll by the same travelThisFrame every
+  // frame, this gap never closes, so the far sign is always seen first.
+  const RAMP_SIGN_LEAD_FAR = 92;
+  const RAMP_SIGN_LEAD_NEAR = 40;
   let rampActive = false;
   let rampSide = 1;
   let rampState = 'none';
@@ -1752,6 +1840,11 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     sideRamp.scale.x = rampSide;
     sideRamp.position.z = RAMP_SPAWN_Z;
     sideRamp.visible = true;
+    const signX = rampSide * (ROAD_HALF_WIDTH + 1.3);
+    rampSignFar.position.set(signX, 0, RAMP_SPAWN_Z + RAMP_SIGN_LEAD_FAR);
+    rampSignNear.position.set(signX, 0, RAMP_SPAWN_Z + RAMP_SIGN_LEAD_NEAR);
+    rampSignFar.visible = true;
+    rampSignNear.visible = true;
     rampActive = true;
     rampState = 'none';
   }
@@ -1761,6 +1854,8 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
       if (rampActive) {
         rampActive = false;
         sideRamp.visible = false;
+        rampSignFar.visible = false;
+        rampSignNear.visible = false;
       }
       rampState = 'none';
       rampSpawnTimer = RAMP_FIRST_DELAY;
@@ -1772,6 +1867,10 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
       return;
     }
     sideRamp.position.z -= travelThisFrame;
+    // Signs scroll in lockstep with the ramp — same travelThisFrame — so the
+    // lead distance set at spawn never closes.
+    rampSignFar.position.z -= travelThisFrame;
+    rampSignNear.position.z -= travelThisFrame;
     // Gated on rampState so the mesh never disappears out from under a car
     // still riding or airborne on it — that would leave updateRamp's guard
     // clause (`if (!rampActive) return`) skipping the rest of its own state
@@ -1781,6 +1880,8 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     if (rampState === 'none' && sideRamp.position.z < -(RAMP_LENGTH + 25)) {
       rampActive = false;
       sideRamp.visible = false;
+      rampSignFar.visible = false;
+      rampSignNear.visible = false;
       rampSpawnTimer = RAMP_INTERVAL_MIN + Math.random() * (RAMP_INTERVAL_MAX - RAMP_INTERVAL_MIN);
     }
   }
@@ -1999,6 +2100,7 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     slot.targetLane = lane;
     slot.laneChanging = false;
     slot.laneChangeCooldown = Math.random() * 1.2;
+    slot.stuckTime = 0;
     slot.launched = false;
     slot.launchVy = 0;
     slot.launchVx = 0;
@@ -2031,7 +2133,12 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     spawnTimer = 1.5;
   }
 
-  function laneClearance(slot, lane, live) {
+  // `ease` shrinks the required gap toward another car as a lane-change
+  // candidate — 1 is the normal, comfortable gap; planTrafficMotion drives it
+  // down the longer a car has been stuck with nowhere to go, so a jam cannot
+  // pin a car in its lane forever. It never touches the road-edge or
+  // player-safety checks, which stay absolute.
+  function laneClearance(slot, lane, live, ease = 1) {
     const candidateX = laneXAtZ(lane, slot.mesh.position.z);
     if (Math.abs(candidateX) > roadHalfWidthAt(slot.mesh.position.z) - CAR_HALF_X * slot.taper) return -Infinity;
     if (slot.mesh.position.z < TRAFFIC_SAFE_ZONE && Math.abs(candidateX - carX) <= TRAFFIC_LANE_CLEARANCE) return -Infinity;
@@ -2040,14 +2147,26 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
       if (other === slot) continue;
       const dz = other.mesh.position.z - slot.mesh.position.z;
       const otherTargetX = laneXAtZ(other.targetLane, other.mesh.position.z);
-      if (Math.abs(otherTargetX - candidateX) < CAR_HALF_X * (slot.taper + other.taper) * 1.125
-        && dz > -LANE_CLEAR_BEHIND && dz < LANE_CLEAR_AHEAD) return -Infinity;
+      if (Math.abs(otherTargetX - candidateX) < CAR_HALF_X * (slot.taper + other.taper) * 1.125 * ease
+        && dz > -LANE_CLEAR_BEHIND * ease && dz < LANE_CLEAR_AHEAD * ease) return -Infinity;
       nearest = Math.min(nearest, Math.abs(dz));
     }
     return nearest;
   }
 
-  function planTrafficMotion(slot, live) {
+  // A car stuck this long with no lane change available starts accepting
+  // progressively tighter gaps (see `ease` in laneClearance). At ease = 0 the
+  // proximity check in laneClearance is mathematically a no-op — the
+  // threshold it compares against shrinks to zero, so "closer than zero" can
+  // never be true — leaving only the absolute road-edge and player-safety
+  // checks standing. That is what turns STUCK_HARD_LIMIT into a real
+  // guarantee rather than just a longer wait: once reached, only running off
+  // the road or into the player's safe zone can still block the change, and
+  // both of those are separately enforced everywhere else in the game.
+  const STUCK_GRACE = 2.2;
+  const STUCK_HARD_LIMIT = 5;
+
+  function planTrafficMotion(slot, live, delta) {
     // Traffic drives its own road: it queues behind slower cars and changes lane
     // around them, but it never reacts to the player. Dodging us — which it used
     // to do from 80 units out, at full traffic speed — made the car in front
@@ -2065,28 +2184,48 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     }
 
     let desiredSpeed = slot.cruiseSpeed;
-    if (!lead) return desiredSpeed;
+    if (!lead) {
+      slot.stuckTime = 0;
+      return desiredSpeed;
+    }
     const closingSpeed = Math.max(0, slot.speed - lead.speed);
     const timeToContact = closingSpeed > 0.5 ? leadGap / (closingSpeed * WORLD_SCALE) : Infinity;
     const threatened = leadGap < 10 || (leadGap < 32 && timeToContact < 2.4);
-    if (!threatened) return desiredSpeed;
+    if (!threatened) {
+      slot.stuckTime = 0;
+      return desiredSpeed;
+    }
 
-    if (!slot.laneChanging && slot.laneChangeCooldown <= 0) {
+    // Eases linearly from 1 (comfortable) down to 0 (proximity check fully
+    // disabled) as stuckTime runs from STUCK_GRACE to STUCK_HARD_LIMIT.
+    const ease = 1 - THREE.MathUtils.clamp(
+      (slot.stuckTime - STUCK_GRACE) / (STUCK_HARD_LIMIT - STUCK_GRACE), 0, 1,
+    );
+    // Once fully desperate (ease bottomed out), the cooldown that normally
+    // paces lane changes stands down too — otherwise it could gate a retry
+    // for another second-plus after the car is already entitled to force
+    // one, quietly breaking the STUCK_HARD_LIMIT guarantee. `laneChanging`
+    // still blocks a second attempt while physically mid-transition, since
+    // that one is already resolving the jam.
+    const desperate = ease <= 0;
+    if (!slot.laneChanging && (slot.laneChangeCooldown <= 0 || desperate)) {
       const laneIndex = LANES.indexOf(slot.lane);
       const candidates = [LANES[laneIndex - 1], LANES[laneIndex + 1]]
         .filter((lane) => lane !== undefined)
-        .map((lane) => ({ lane, clearance: laneClearance(slot, lane, live) }))
+        .map((lane) => ({ lane, clearance: laneClearance(slot, lane, live, ease) }))
         .filter((candidate) => Number.isFinite(candidate.clearance))
         .sort((a, b) => b.clearance - a.clearance);
       if (candidates.length) {
         slot.targetLane = candidates[0].lane;
         slot.laneChanging = true;
         slot.laneChangeCooldown = LANE_CHANGE_COOLDOWN + Math.random() * 1.4;
+        slot.stuckTime = 0;
         laneChanges += 1;
         return desiredSpeed;
       }
     }
 
+    slot.stuckTime += delta;
     // No safe adjacent lane: blend down toward the leading car instead of
     // relying on the collision solver to absorb a preventable rear-end.
     desiredSpeed = Math.min(desiredSpeed, Math.max(38, lead.speed - (leadGap < 7 ? 8 : 2)));
@@ -2147,7 +2286,7 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     });
 
     live.forEach((slot) => {
-      const desiredSpeed = planTrafficMotion(slot, live);
+      const desiredSpeed = planTrafficMotion(slot, live, delta);
       const speedResponse = desiredSpeed < slot.speed ? 4.8 : 0.85;
       slot.speed = THREE.MathUtils.clamp(
         THREE.MathUtils.lerp(slot.speed, desiredSpeed, 1 - Math.exp(-speedResponse * delta)),
@@ -2411,6 +2550,10 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
       playerLaneIntrusions: raceWorld.traffic.slots.filter((slot) => slot.active
         && Math.abs(slot.mesh.position.z) < TRAFFIC_SAFE_ZONE
         && Math.abs(slot.mesh.position.x - carX) <= TRAFFIC_LANE_CLEARANCE).length,
+      // How long the most-blocked active car has been unable to find a lane
+      // change. Should never run away — the ease mechanism in
+      // planTrafficMotion bounds this near STUCK_DESPERATE_AFTER.
+      maxStuckTime: Number(Math.max(0, ...raceWorld.traffic.slots.filter((slot) => slot.active).map((slot) => slot.stuckTime)).toFixed(1)),
       initialSeed: TRAFFIC_SEED_COUNT,
       maxActive: TRAFFIC_MAX_ACTIVE,
       raceTime: Number(raceTime.toFixed(1)),

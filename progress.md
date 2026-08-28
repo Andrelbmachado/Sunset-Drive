@@ -1,5 +1,13 @@
 Original prompt: gere o threejs desse carro, o mais detalhista possivel.
 
+## 2026-08-28 — Traffic can't wall up, ramp warning signs, buildings emerge earlier
+
+- Traffic can no longer clump into a permanent wall. A car blocked from changing lanes now escalates: past `STUCK_GRACE` (2.2s) it accepts progressively tighter gaps, and past `STUCK_HARD_LIMIT` (5s) the proximity check disables itself entirely (its threshold shrinks to zero, so "closer than zero" can never trigger) and the lane-change cooldown stands down too — only the absolute road-edge and player-safety checks can still hold a car back. First pass only eased the gap requirement and still gated retries on the cooldown, which let peak stuck time hit 9.9s in a 75s stress test; fixing the cooldown-bypass brought repeat runs down to 4.6–5.6s, consistently near the intended ceiling. Verified across five separate 75s runs with zero position overlaps throughout.
+- Added two roadside warning signs ahead of every ramp spawn — a real road-sign yellow/black diagonal stripe with a neon-blue arrow, canvas-textured to match the license-plate technique already used on the car. They scroll in lockstep with the ramp (same `travelThisFrame`), so the lead distance never closes and the far sign is always seen first. Confirmed via screenshot: the near sign reads clearly well before the ramp itself is reachable.
+- Thinned fog further (0.0034 → 0.0022) so the skyline stops snapping from empty haze to fully visible in a couple of seconds at speed. At the old density buildings were under 6% visible past z=500; at the new one they're ~30% visible by z=500 and ~65% by z=300, while the far LOD skyline's own edge (~z=790) is still faint enough (~5%) that its hard visibility cutoff never reads as a pop. Confirmed via screenshot: the skyline now reads as a gradual approach rather than a sudden appearance.
+- Production build, all four Sites tests, and a ramp regression pass (ride → launch → land, zero overlaps) all still pass after the shared-code changes (`planTrafficMotion`'s signature gained a `delta` parameter).
+- TODO: none for this request.
+
 ## 2026-08-28 — Gauge HUD, coins, machine-gun cannon and the side ramp
 
 - Torque now rises and falls at the same rate (`TORQUE_RATE = 1/GEAR_SECONDS`); off-throttle coasting decelerates at the current gear's own acceleration rate instead of a flat `COAST_DECEL` that used to decelerate harder than any gear could accelerate. Verified with a clean 400ms trace either side of releasing the throttle: coast torque drops at ~0.95/s, matching `TORQUE_RATE` (1/1.05) precisely.
