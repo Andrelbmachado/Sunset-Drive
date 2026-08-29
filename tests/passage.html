@@ -1,0 +1,87 @@
+<!doctype html><meta charset="utf-8"><body><pre id="out">running</pre>
+<script type="module">
+import { firstBlockedSlice } from '/src/scene.js';
+
+const LANES = [-4.6, -1.55, 1.55, 4.6];
+const car = (lane, z, extra = {}) => ({
+  x: lane, taper: 1, targetLane: lane, mesh: { position: { z } }, ...extra,
+});
+
+const results = [];
+const check = (name, pass, detail) => results.push({ name, pass, detail });
+
+// A wall: all four lanes occupied at the same z, right in front of the player.
+const wall = LANES.map((lane) => car(lane, 70));
+check('four-lane wall is detected', firstBlockedSlice(wall, 0) >= 0, firstBlockedSlice(wall, 0));
+
+// Three lanes blocked, one open, and the open one is reachable in time.
+const gap = LANES.slice(0, 3).map((lane) => car(lane, 70));
+check('one open lane is passable', firstBlockedSlice(gap, 0) === -1, firstBlockedSlice(gap, 0));
+
+// Empty road.
+check('empty road is passable', firstBlockedSlice([], 0) === -1, firstBlockedSlice([], 0));
+
+// A car already committed to leaving the wall must stop counting as a wall:
+// same four cars, but the outer one is heading for the shoulder-most lane it
+// already sits in... instead, move the second car out to a lane off the wall.
+const leaving = [
+  car(LANES[0], 90),
+  car(LANES[1], 90, { targetLane: LANES[0] }),
+  car(LANES[2], 90),
+  car(LANES[3], 90),
+];
+// With lane 1's car sliding into lane 0, lane 1 opens by the time we arrive.
+check('a car evacuating is not a wall', firstBlockedSlice(leaving, 0) === -1, firstBlockedSlice(leaving, 0));
+
+// The same evacuation right on top of the player has no time to complete.
+const leavingClose = leaving.map((c) => ({ ...c, mesh: { position: { z: 30 } } }));
+check('an evacuation too close to finish still walls', firstBlockedSlice(leavingClose, 0) >= 0, firstBlockedSlice(leavingClose, 0));
+
+// A wall far beyond the lookahead is not this frame's problem.
+const far = LANES.map((lane) => car(lane, 400));
+check('a wall past the lookahead is ignored', firstBlockedSlice(far, 0) === -1, firstBlockedSlice(far, 0));
+
+// The layout seedTraffic actually produces: one car every 10.5 units, cycling
+// through the three lanes that are not the reserved one, with the reserved
+// lane stepping sideways every SEED_OPEN_RUN cars.
+const SEED_OPEN_RUN = 6;
+const neighbour = (lane) => (lane === 0 ? 1 : lane === LANES.length - 1 ? LANES.length - 2 : lane + (Math.random() < 0.5 ? -1 : 1));
+// Every corridor the seed can produce has to be passable, not just one lucky
+// draw, so this walks many random seeds.
+let seedFailures = 0;
+let worstSeed = null;
+for (let trial = 0; trial < 3000; trial += 1) {
+  const seeded = [];
+  let openLane = Math.floor(Math.random() * LANES.length);
+  let nextLane = neighbour(openLane);
+  for (let ahead = 0; ahead < 16; ahead += 1) {
+    if (ahead > 0 && ahead % SEED_OPEN_RUN === 0) { openLane = nextLane; nextLane = neighbour(openLane); }
+    const options = LANES.filter((_, index) => index !== openLane && index !== nextLane);
+    seeded.push(car(options[ahead % options.length], 46 + ahead * 10.5));
+  }
+  // The player starts at x = 0, mid-road.
+  const blocked = firstBlockedSlice(seeded, 0);
+  if (blocked !== -1) { seedFailures += 1; if (!worstSeed) worstSeed = { blocked, lanes: seeded.map((c) => c.x) }; }
+}
+check('every random seed layout is passable', seedFailures === 0, { seedFailures, worstSeed });
+
+// The lane cycle seedTraffic used before: four consecutive cars cover every
+// lane inside one short stretch, which is exactly the wall this replaced.
+const naive = [];
+for (let ahead = 0; ahead < 16; ahead += 1) naive.push(car(LANES[ahead % LANES.length], 46 + ahead * 10.5));
+check('the old straight lane cycle walls the road', firstBlockedSlice(naive, 0) >= 0, firstBlockedSlice(naive, 0));
+
+// The same staircase jumping across the whole road at once is not: from the
+// far left kerb to the far right in 32 units is beyond the car's lateral speed.
+const jump = [];
+LANES.forEach((lane, index) => { if (index !== 0) jump.push(car(lane, 40)); });
+LANES.forEach((lane, index) => { if (index !== 3) jump.push(car(lane, 72)); });
+check('an unreachable lane jump is detected', firstBlockedSlice(jump, LANES[0]) >= 0, firstBlockedSlice(jump, LANES[0]));
+
+document.getElementById('out').textContent = JSON.stringify({
+  passed: results.filter((r) => r.pass).length,
+  failed: results.filter((r) => !r.pass).length,
+  results,
+}, null, 2);
+window.__done = true;
+</script></body>

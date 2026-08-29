@@ -336,7 +336,7 @@ function createNeonShots(scene) {
     bolt.add(new THREE.Mesh(coreGeometry, coreMaterial), new THREE.Mesh(haloGeometry, haloMaterial));
     bolt.visible = false;
     group.add(bolt);
-    slots.push({ mesh: bolt, active: false, x: 0, z: 0 });
+    slots.push({ mesh: bolt, active: false, x: 0, y: 0.78, z: 0 });
   }
   scene.add(group);
   return { group, slots };
@@ -369,14 +369,26 @@ function createImpactBursts(scene) {
   return { group, slots };
 }
 
-// Gold coins scattered along the road. A fixed-size pool scrolls with the
-// world like scenery; collecting one (or letting it pass uncollected) just
-// respawns it further ahead in a random lane, so the road never runs dry.
-const COIN_POOL_SIZE = 10;
+// Gold coins laid along the road in orderly queues rather than scattered: a
+// group is five coins evenly spaced down one lane, and the next group picks a
+// different lane, so the road reads as a deliberate trail to follow instead of
+// a random sprinkle. Collecting a coin only removes that coin; a whole group
+// is relaid ahead, in a new lane, once its entire queue has passed the player.
+const COIN_GROUP_SIZE = 5;
+const COIN_GROUP_COUNT = 3;
+const COIN_POOL_SIZE = COIN_GROUP_SIZE * COIN_GROUP_COUNT;
+// Gap between consecutive coins in one queue. At full speed the player crosses
+// this in ~0.09 s, which is what makes a run down a queue read as a streak.
+const COIN_SPACING = 9;
 const COIN_MIN_Z = 55;
-const COIN_MAX_Z = 240;
+// Clear road between the tail of one queue and the head of the next, so the
+// lane change between groups is legible rather than one continuous ribbon.
+const COIN_GROUP_GAP_MIN = 48;
+const COIN_GROUP_GAP_MAX = 96;
 const COIN_COLLECT_HALF_X = 1.5;
 const COIN_COLLECT_HALF_Z = 1.6;
+// Local z of the last coin in a queue, relative to the queue's head.
+const COIN_QUEUE_LENGTH = (COIN_GROUP_SIZE - 1) * COIN_SPACING;
 
 function createCoins(scene) {
   const group = new THREE.Group();
@@ -388,16 +400,22 @@ function createCoins(scene) {
   const material = new THREE.MeshStandardMaterial({
     color: 0xffd23d, emissive: 0xffae00, emissiveIntensity: 2.4, metalness: 0.78, roughness: 0.26,
   });
-  const slots = [];
-  for (let i = 0; i < COIN_POOL_SIZE; i += 1) {
-    const mesh = new THREE.Mesh(geometry, material);
-    mesh.castShadow = true;
-    addEdges(mesh, 0xfff2c2, 0.55, 12);
-    group.add(mesh);
-    slots.push({ mesh });
+  const groups = [];
+  for (let g = 0; g < COIN_GROUP_COUNT; g += 1) {
+    const slots = [];
+    for (let i = 0; i < COIN_GROUP_SIZE; i += 1) {
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.castShadow = true;
+      addEdges(mesh, 0xfff2c2, 0.55, 12);
+      group.add(mesh);
+      slots.push({ mesh, collected: false });
+    }
+    // `headZ` is the queue's leading coin — the lowest z, and so the first one
+    // the player reaches as the world scrolls toward them.
+    groups.push({ lane: LANES[g % LANES.length], headZ: 0, slots });
   }
   scene.add(group);
-  return { group, slots };
+  return { group, groups };
 }
 
 // White speed streaks that tear past the car once it is pinned at max speed.
@@ -635,6 +653,11 @@ const HIT_HALF_Z = 5.8;
 // Traffic-to-traffic uses two of the smaller body.
 const CAR_HALF_X = 0.95;
 const CAR_HALF_Z = 2.1;
+// The player's own half-width and lateral authority. Both live out here rather
+// than in the experience closure because the passage sweep below is a pure
+// function of the traffic and the car's x, and is exercised directly by tests.
+const CAR_HALF_WIDTH = 1.45;
+const LATERAL_SPEED = 9.5;
 // The solver settles resting bodies at exactly their summed half-extents, so a
 // queue of cars sitting bumper to bumper lands a few thousandths inside a strict
 // comparison. Only a gap smaller than this counts as real interpenetration.
@@ -653,6 +676,165 @@ const LANE_CLEAR_BEHIND = 10;
 // 2.6 clearance at least two lanes always survive the filter.
 function safeLanes(x) {
   return LANES.filter((lane) => Math.abs(lane - x) > TRAFFIC_LANE_CLEARANCE);
+}
+
+// The road must always offer a way through at full throttle — this game is
+// about weaving without lifting, not about braking. Reserving a whole lane
+// outright would have traffic shuffling constantly at this density, so instead
+// the corridor ahead is swept as a reachability problem: the player's lateral
+// speed bounds how far sideways they can get per unit of road travelled, so the
+// set of x positions still reachable is carried slice by slice through the free
+// gaps between cars. If that set ever empties, the road is genuinely walled and
+// one car is moved to open it (see openPassage).
+const PASSAGE_SLICES = 11;
+const PASSAGE_SLICE_LENGTH = 13;
+// The sweep is about the road ahead, not the car's immediate surroundings.
+// Starting it level with the player instead makes simply driving alongside
+// another car register as a wall — the player's own body fills the slice — and
+// the correction below would then be shoving traffic out of the way at
+// touching distance, which is exactly the dodging the traffic must never do.
+const PASSAGE_START_Z = 26;
+// A gap must beat this to count as drivable. The blockers below already carry
+// the player's own half-width, so this is pure comfort margin on top.
+const PASSAGE_MIN_GAP = 0.5;
+// No car nearer than this is ever moved to open a corridor. Inside it, a
+// correction would read as traffic dodging the player — the one thing this
+// traffic must never do — and a wall that close was the driver's to steer
+// around anyway. Comfortably beyond TRAFFIC_SAFE_ZONE, the band where spawns
+// already keep clear of the player.
+const PASSAGE_ACTION_MIN_Z = 90;
+// Minimum seconds between corrections, so the road rearranges at the pace of
+// traffic rather than snapping open.
+const PASSAGE_ACTION_INTERVAL = 0.5;
+// Slices in the maintained corridor. Enough to reach past TRAFFIC_SPAWN_Z from
+// PASSAGE_ACTION_MIN_Z, so a burst of spawns that lands a ready-made wall is
+// caught the frame it is created — seconds before it drifts close enough that
+// clearing it would be either rushed or off-limits.
+const PASSAGE_WALL_SLICES = 10;
+
+// Free x-spans across one z-slice: the drivable road minus every car body that
+// reaches into it. Cars are placed where they will actually be when the player
+// arrives, so one already sliding out of the way is not counted as a wall.
+function passageSpans(live, z, arrivalTime) {
+  const limit = roadHalfWidthAt(z) - CAR_HALF_WIDTH * taperAt(z);
+  if (limit <= 0) return [];
+  let spans = [[-limit, limit]];
+  for (const slot of live) {
+    const slotZ = slot.mesh.position.z;
+    if (Math.abs(slotZ - z) > HIT_HALF_Z + PASSAGE_SLICE_LENGTH / 2) continue;
+    const targetX = laneXAtZ(slot.targetLane, slotZ);
+    const travel = LANE_CHANGE_SPEED * arrivalTime;
+    const predictedX = slot.x + THREE.MathUtils.clamp(targetX - slot.x, -travel, travel);
+    const reach = HIT_HALF_X * slot.taper;
+    const lo = predictedX - reach;
+    const hi = predictedX + reach;
+    const next = [];
+    for (const span of spans) {
+      if (hi <= span[0] || lo >= span[1]) next.push(span);
+      else {
+        if (lo > span[0]) next.push([span[0], lo]);
+        if (hi < span[1]) next.push([hi, span[1]]);
+      }
+    }
+    spans = next;
+    if (!spans.length) return spans;
+  }
+  return spans.filter((span) => span[1] - span[0] >= PASSAGE_MIN_GAP);
+}
+
+// Widens every span by `reach` on both sides and merges what now overlaps.
+// Inputs are sorted and disjoint, and both properties survive.
+function dilateSpans(spans, reach) {
+  const merged = [];
+  for (const span of spans) {
+    const lo = span[0] - reach;
+    const hi = span[1] + reach;
+    const last = merged[merged.length - 1];
+    if (last && lo <= last[1]) last[1] = Math.max(last[1], hi);
+    else merged.push([lo, hi]);
+  }
+  return merged;
+}
+
+function intersectSpans(a, b) {
+  const out = [];
+  let i = 0;
+  let j = 0;
+  while (i < a.length && j < b.length) {
+    const lo = Math.max(a[i][0], b[j][0]);
+    const hi = Math.min(a[i][1], b[j][1]);
+    if (hi - lo >= PASSAGE_MIN_GAP) out.push([lo, hi]);
+    if (a[i][1] < b[j][1]) i += 1;
+    else j += 1;
+  }
+  return out;
+}
+
+// How long until the player reaches a given z, planned at the top speed they
+// are entitled to hold. That is the tightest lateral budget and the shortest
+// warning, so a corridor that survives this check survives at any speed.
+function arrivalTimeAt(z) {
+  return Math.max(0, z) / (MAX_PLAYER_SPEED * WORLD_SCALE);
+}
+
+// Index of the first slice ahead the player can no longer reach any part of,
+// or -1 when the corridor stays open the whole way out. Exported so the
+// guarantee can be exercised directly against adversarial traffic rather than
+// only observed through a live drive.
+// `onRoad` false means the car is off riding a ramp or flying the easter egg.
+// Its x is then somewhere out past the kerb and says nothing about where it
+// will rejoin, so the sweep asks the weaker question that actually matters
+// there — whether a passage exists at all — rather than pinning the plan to a
+// position the player is not in and would not land at.
+export function firstBlockedSlice(live, carX, {
+  onRoad = true, slices = PASSAGE_SLICES, startZ = PASSAGE_START_Z,
+} = {}) {
+  // Lateral units the player can buy per unit of road, at the top speed they
+  // are entitled to hold.
+  const perUnit = LATERAL_SPEED / (MAX_PLAYER_SPEED * WORLD_SCALE);
+  const reach = perUnit * PASSAGE_SLICE_LENGTH;
+  const edge = ROAD_HALF_WIDTH - CAR_HALF_WIDTH;
+  // The first slice is further off than the rest, so it gets its own budget.
+  const seedReach = perUnit * startZ;
+  const from = THREE.MathUtils.clamp(carX, -edge, edge);
+  let spans = onRoad
+    ? [[Math.max(-edge, from - seedReach), Math.min(edge, from + seedReach)]]
+    : [[-edge, edge]];
+  for (let i = 0; i < slices; i += 1) {
+    const z = startZ + i * PASSAGE_SLICE_LENGTH;
+    if (i > 0) spans = dilateSpans(spans, reach);
+    spans = intersectSpans(spans, passageSpans(live, z, arrivalTimeAt(z)));
+    if (!spans.length) return i;
+  }
+  return -1;
+}
+
+// The corridor the system actually maintains, and the only one it will move a
+// car to protect: from the distance where a correction still reads as traffic
+// flowing rather than dodging, out past the spawn band.
+//
+// It is seeded with the whole road rather than the player's own x on purpose.
+// Judging a far wall from where the car happens to be right now conflates two
+// different things: a genuine wall, which is the road's fault and fixable, and
+// the player having simply not moved over yet, which is theirs. Worse, a near
+// obstruction the policy forbids touching would otherwise shadow every fixable
+// wall behind it — openPassage stops at the first blocked slice — so the far
+// road silently stopped being maintained exactly when it was busiest.
+export function firstWallAhead(live) {
+  return firstBlockedSlice(live, 0, {
+    onRoad: false, slices: PASSAGE_WALL_SLICES, startZ: PASSAGE_ACTION_MIN_Z,
+  });
+}
+
+// Centre of the widest gap in the traffic at a given distance — where a driver
+// looking that far up the road would aim. Null when nothing is open there.
+export function aimXAt(live, z) {
+  const spans = passageSpans(live, z, arrivalTimeAt(z));
+  let best = null;
+  for (const span of spans) {
+    if (!best || span[1] - span[0] > best[1] - best[0]) best = span;
+  }
+  return best ? (best[0] + best[1]) / 2 : null;
 }
 
 function createTraffic(scene) {
@@ -1340,13 +1522,10 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   const shots = createNeonShots(scene);
   const bursts = createImpactBursts(scene);
   const coins = createCoins(scene);
-  // Staggered ahead in a round-robin of lanes so the pool starts spread out
-  // instead of clumped at one z.
-  coins.slots.forEach((slot, index) => {
-    const lane = LANES[index % LANES.length];
-    const z = COIN_MIN_Z + (index / coins.slots.length) * (COIN_MAX_Z - COIN_MIN_Z) + Math.random() * 8;
-    slot.mesh.position.set(lane, 0.95, z);
-  });
+  // Function declarations are hoisted, so the first queues can be laid out
+  // here even though resetCoins is defined further down with the rest of the
+  // per-race state.
+  resetCoins();
   const sideRamp = buildSideRampMesh();
   scene.add(sideRamp);
   const rampSignFar = buildRampSign();
@@ -1449,8 +1628,6 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   const LAUNCH_BOOST = 116;
   const BRAKE_DECEL = 160;
   const REVERSE_ACCEL = 55;
-  const LATERAL_SPEED = 9.5;
-  const CAR_HALF_WIDTH = 1.45;
   let gearIndex = 0;
   let shiftTimer = 0;
   let launchTimer = 0;
@@ -1464,6 +1641,11 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   let impactFlash = 0;
   let collisions = 0;
   let laneChanges = 0;
+  // How many times the passage sweep had to step in. Watched during tuning:
+  // a high rate means the traffic density is fighting the guarantee rather
+  // than living inside it.
+  let passageOpenings = 0;
+  let passageCooldown = 0;
   let wasRunning = false;
   // Counts up toward SHOT_HOLD_INTERVAL while Space is held; a discrete tap
   // fires immediately and does not wait on this.
@@ -1495,20 +1677,63 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   // machine now owns y (as a 'falling' phase) while this only eases x back
   // toward the road.
   const RAMP_SPAWN_Z = 175;
-  const RAMP_FIRST_DELAY = 12;
-  const RAMP_INTERVAL_MIN = 24;
-  const RAMP_INTERVAL_MAX = 40;
-  // Constant lead ahead of the ramp's own entry point, in world units — since
-  // both the sign and the ramp scroll by the same travelThisFrame every
-  // frame, this gap never closes, so the far sign is always seen first.
-  const RAMP_SIGN_LEAD_FAR = 92;
-  const RAMP_SIGN_LEAD_NEAR = 40;
+  // Roughly five times as many ramps as before. Most of a cycle is travel
+  // rather than waiting: 120 units for the ramp to follow its warning signs in,
+  // then 255 more for it to clear the camera — about 3.9 s at full speed — so
+  // the idle gap below is what is left to reach a ~6.5 s period.
+  const RAMP_FIRST_DELAY = 2;
+  const RAMP_INTERVAL_MIN = 1.5;
+  const RAMP_INTERVAL_MAX = 3.5;
+  // How far the player travels between passing a warning sign and reaching the
+  // ramp's own entry point. The world only ever scrolls one way, so an object
+  // is reached in ascending z: to be passed *before* the ramp, a sign has to
+  // sit at a *lower* z than it. Spawning it lower would make it pop into
+  // existence a short way in front of the bumper, so instead every piece of a
+  // ramp announcement is spawned at the same far RAMP_SPAWN_Z and staged by
+  // how far the world has scrolled since the cycle began (rampCycleTravel).
+  // Each one therefore fades in out of the same distance, and the far sign is
+  // always reached first, then the near sign, then the ramp.
+  const RAMP_SIGN_LEAD_FAR = 120;
+  const RAMP_SIGN_LEAD_NEAR = 55;
   let rampActive = false;
   let rampSide = 1;
   let rampState = 'none';
   let rampSpawnTimer = RAMP_FIRST_DELAY;
   let rampLandingTargetX = 0;
   let rampLaunches = 0;
+  // Distance scrolled since the current announcement's far sign appeared, or
+  // -1 when no cycle is staged.
+  let rampCycleTravel = -1;
+
+  // Hidden flight mode. Tapping Space while the car is still in the air off a
+  // ramp trades the cannon for the controls of a low-flying car: the arrows
+  // become altitude and lateral drift, the throttle pins itself at maximum,
+  // and the road below is just scenery until the player chooses to touch down.
+  // Deliberately undocumented in the on-screen key list — it is an easter egg.
+  const FLIGHT_CEILING = 26;
+  const FLIGHT_CLIMB_SPEED = 12;
+  const FLIGHT_LATERAL_SPEED = 14;
+  // How far off the centreline the flight may wander. Well outside the road,
+  // but inside the detailed scenery ring so there is always something to see.
+  const FLIGHT_HALF_WIDTH = 24;
+  // Below this the flight is on approach and the corridor narrows to the road
+  // itself, so coming down always ends on the deck. A launch throws the car
+  // well past the kerb, so without this a descent out over the rocks would
+  // stall at a floor with nothing on screen explaining why — and landing there
+  // outright would teleport the car back inside the road clamp from twenty
+  // units away. Funnelling it in costs the player no control they would miss:
+  // they still choose when to descend.
+  const FLIGHT_LANDING_Y = 7;
+  let flightState = 'none';
+  let flightY = 0;
+  let flights = 0;
+
+  // True only when the car is genuinely down on the road sharing it with
+  // traffic. Riding or flying deliberately takes it outside those bounds, so
+  // the road-edge clamp and player-vs-traffic collision both stand down.
+  function carOnRoad() {
+    return rampState === 'none' && flightState === 'none';
+  }
 
   const onKeyDown = (event) => {
     if (event.code === 'KeyF') {
@@ -1532,7 +1757,10 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
       // clicking. Holding the key down additionally keeps it in `keys`, which
       // the fixed-cadence auto-fire in updateShots reads every frame.
       if (!event.repeat) {
-        fireNeonShot();
+        // The one exception: mid-flight off a ramp, this press takes off
+        // instead of firing. Once flying, Space goes back to being the cannon.
+        if (rampState === 'airborne' && flightState === 'none') startFlight();
+        else fireNeonShot();
         spaceAutoFireTimer = 0;
       }
       keys.add(event.code);
@@ -1573,18 +1801,29 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   }
 
   function updateDriving(delta, elapsed) {
+    const flying = flightState === 'flying';
     const accelerating = keys.has('ArrowUp') || keys.has('KeyW');
     const braking = keys.has('ArrowDown') || keys.has('KeyS');
-    isAccelerating = raceRunning && accelerating && !braking;
-    isBraking = raceRunning && braking;
-    const steeringLeft = keys.has('ArrowLeft') || keys.has('KeyA');
-    const steeringRight = keys.has('ArrowRight') || keys.has('KeyD');
+    // In flight the arrows fly the car rather than drive it, so the engine is
+    // reported as pinned open regardless of which of them is held.
+    isAccelerating = raceRunning && (flying || (accelerating && !braking));
+    isBraking = raceRunning && braking && !flying;
+    const steeringLeft = !flying && (keys.has('ArrowLeft') || keys.has('KeyA'));
+    const steeringRight = !flying && (keys.has('ArrowRight') || keys.has('KeyD'));
     let pitchTarget = 0;
 
     if (!raceRunning) {
       speed = THREE.MathUtils.lerp(speed, 0, 1 - Math.exp(-3 * delta));
       torque = THREE.MathUtils.lerp(torque, 0, 1 - Math.exp(-5 * delta));
       gearIndex = 0;
+      shiftTimer = 0;
+      launchTimer = 0;
+    } else if (flying) {
+      // Throttle held wide open for the whole flight: altitude is the only
+      // thing the player is steering now.
+      speed = THREE.MathUtils.lerp(speed, MAX_SPEED, 1 - Math.exp(-3 * delta));
+      torque = THREE.MathUtils.lerp(torque, 1, 1 - Math.exp(-3 * delta));
+      gearIndex = GEARS.length - 1;
       shiftTimer = 0;
       launchTimer = 0;
     } else if (shiftTimer > 0) {
@@ -1628,8 +1867,11 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     }
     prevAccelerating = accelerating;
     speed = THREE.MathUtils.clamp(speed, MAX_REVERSE, MAX_SPEED);
-    bodyPitch = THREE.MathUtils.lerp(bodyPitch, pitchTarget, 1 - Math.exp(-12 * delta));
-    model.car.rotation.x = bodyPitch;
+    // While flying, updateFlight pitches the nose to the climb instead.
+    if (!flying) {
+      bodyPitch = THREE.MathUtils.lerp(bodyPitch, pitchTarget, 1 - Math.exp(-12 * delta));
+      model.car.rotation.x = bodyPitch;
+    }
 
     // Screen-right is world -x from the chase camera, so lateral motion and the
     // nose yaw both invert the raw steer input.
@@ -1639,19 +1881,25 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     steerDirection = raceRunning ? steerTarget : 0;
     steer = THREE.MathUtils.lerp(steer, steerTarget, 1 - Math.exp(-8 * delta));
     const steerAuthority = THREE.MathUtils.clamp(Math.abs(speed) / 26, 0.22, 1);
-    carX -= steer * LATERAL_SPEED * steerAuthority * delta;
-    // Sideways knocks from a contact ride on top of the steering and decay.
-    carX += carVX * delta;
+    // updateFlight owns carX outright while flying, so the road-going steering
+    // must not also integrate into it.
+    if (!flying) {
+      carX -= steer * LATERAL_SPEED * steerAuthority * delta;
+      // Sideways knocks from a contact ride on top of the steering and decay.
+      carX += carVX * delta;
+    }
     carVX -= carVX * Math.min(1, LATERAL_DAMPING * delta);
-    // The side ramp intentionally takes the car outside the road's normal
-    // bounds; updateRamp owns carX for the rest of this frame while riding
-    // or airborne, so the everyday clamp has to stand down.
-    if (rampState === 'none') {
+    // The side ramp and the flight easter egg both intentionally take the car
+    // outside the road's normal bounds; updateRamp / updateFlight own carX for
+    // the rest of the frame in those states, so the everyday clamp stands down.
+    if (carOnRoad()) {
       carX = THREE.MathUtils.clamp(carX, -(ROAD_HALF_WIDTH - CAR_HALF_WIDTH), ROAD_HALF_WIDTH - CAR_HALF_WIDTH);
       model.car.position.x = carX;
     }
-    model.car.rotation.z = THREE.MathUtils.lerp(model.car.rotation.z, -steer * 0.045 + carVX * 0.012, 1 - Math.exp(-6 * delta));
-    model.car.rotation.y = THREE.MathUtils.lerp(model.car.rotation.y, -steer * 0.16 - carVX * 0.02, 1 - Math.exp(-5 * delta));
+    if (!flying) {
+      model.car.rotation.z = THREE.MathUtils.lerp(model.car.rotation.z, -steer * 0.045 + carVX * 0.012, 1 - Math.exp(-6 * delta));
+      model.car.rotation.y = THREE.MathUtils.lerp(model.car.rotation.y, -steer * 0.16 - carVX * 0.02, 1 - Math.exp(-5 * delta));
+    }
     wheelAngle -= delta * (speed * 0.11);
     model.wheels.forEach((wheel, index) => {
       wheel.rotation.x = wheelAngle;
@@ -1762,12 +2010,15 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     shot.active = true;
     shot.x = carX;
     shot.z = SHOT_MUZZLE_Z;
+    // Tracked per bolt rather than fixed, so a shot fired from altitude during
+    // the flight easter egg leaves the muzzle where the muzzle actually is.
+    shot.y = model.car.position.y + 0.76;
     shot.mesh.visible = true;
-    shot.mesh.position.set(shot.x, 0.78, shot.z);
+    shot.mesh.position.set(shot.x, shot.y, shot.z);
     shotsFired += 1;
     // Muzzle flash at the nose, so firing reads even when the bolt is already
     // downrange by the next frame. Small and brief — it is right under the lens.
-    spawnBurst(carX, 0.78, SHOT_MUZZLE_Z, { scale: 0.3, seconds: 0.16, growth: 2.4 });
+    spawnBurst(carX, shot.y, SHOT_MUZZLE_Z, { scale: 0.3, seconds: 0.16, growth: 2.4 });
     carAudio.shot();
   }
 
@@ -1812,76 +2063,137 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     });
   }
 
-  function respawnCoin(slot) {
-    slot.mesh.position.x = LANES[Math.floor(Math.random() * LANES.length)];
-    slot.mesh.position.z = COIN_MIN_Z + Math.random() * (COIN_MAX_Z - COIN_MIN_Z);
+  // Relays one queue ahead of every other queue currently out, in a lane it was
+  // not already using — that lane switch between groups is the whole point of
+  // laying coins out in fives.
+  function relayCoinGroup(group) {
+    const furthestTail = coins.groups.reduce(
+      (max, other) => (other === group ? max : Math.max(max, other.headZ + COIN_QUEUE_LENGTH)),
+      COIN_MIN_Z,
+    );
+    group.headZ = furthestTail + COIN_GROUP_GAP_MIN + Math.random() * (COIN_GROUP_GAP_MAX - COIN_GROUP_GAP_MIN);
+    const options = LANES.filter((lane) => lane !== group.lane);
+    group.lane = options[Math.floor(Math.random() * options.length)];
+    group.slots.forEach((slot) => {
+      slot.collected = false;
+      slot.mesh.visible = true;
+    });
+  }
+
+  function resetCoins() {
+    let headZ = COIN_MIN_Z;
+    coins.groups.forEach((group, index) => {
+      group.lane = LANES[index % LANES.length];
+      group.headZ = headZ;
+      headZ += COIN_QUEUE_LENGTH + COIN_GROUP_GAP_MIN + Math.random() * (COIN_GROUP_GAP_MAX - COIN_GROUP_GAP_MIN);
+      group.slots.forEach((slot) => {
+        slot.collected = false;
+        slot.mesh.visible = true;
+      });
+    });
+    layoutCoins(0);
+  }
+
+  // Positions every coin from its group's head. Coins ride the road's taper on
+  // x like the traffic does, so a distant queue stays on the narrowing deck
+  // instead of hanging off its edge.
+  function layoutCoins(delta) {
+    coins.groups.forEach((group) => {
+      group.slots.forEach((slot, index) => {
+        const z = group.headZ + index * COIN_SPACING;
+        slot.mesh.position.set(laneXAtZ(group.lane, z), 0.95, z);
+        if (!slot.collected) slot.mesh.rotation.y += delta * 2.6;
+      });
+    });
   }
 
   function updateCoins(delta) {
     if (!raceRunning) return;
-    coins.slots.forEach((slot) => {
-      slot.mesh.position.z -= travelThisFrame;
-      slot.mesh.rotation.y += delta * 2.6;
-      if (slot.mesh.position.z < -8) {
-        respawnCoin(slot);
-        return;
-      }
-      if (Math.abs(slot.mesh.position.x - carX) < COIN_COLLECT_HALF_X
-        && Math.abs(slot.mesh.position.z) < COIN_COLLECT_HALF_Z) {
-        coinsCollected += 1;
-        carAudio.coin();
-        respawnCoin(slot);
-      }
+    coins.groups.forEach((group) => {
+      group.headZ -= travelThisFrame;
+      group.slots.forEach((slot, index) => {
+        if (slot.collected) return;
+        const z = group.headZ + index * COIN_SPACING;
+        if (Math.abs(group.lane - carX) < COIN_COLLECT_HALF_X && Math.abs(z) < COIN_COLLECT_HALF_Z) {
+          slot.collected = true;
+          slot.mesh.visible = false;
+          coinsCollected += 1;
+          carAudio.coin();
+        }
+      });
+      // Only once the whole queue is behind the player is the group relaid, so
+      // a collected coin leaves a real gap in the line rather than teleporting.
+      if (group.headZ + COIN_QUEUE_LENGTH < -8) relayCoinGroup(group);
     });
+    layoutCoins(delta);
+  }
+
+  // Opens an announcement: picks the side and puts the far warning sign out at
+  // the spawn distance. The near sign and the ramp itself follow from
+  // updateRampSpawn as the world scrolls, so all three enter from the same
+  // distance in the order the player needs to meet them.
+  function beginRampCycle() {
+    rampSide = Math.random() < 0.5 ? -1 : 1;
+    const signX = rampSide * (ROAD_HALF_WIDTH + 1.3);
+    rampSignFar.position.set(signX, 0, RAMP_SPAWN_Z);
+    rampSignFar.visible = true;
+    rampSignNear.position.set(signX, 0, RAMP_SPAWN_Z);
+    rampSignNear.visible = false;
+    rampCycleTravel = 0;
   }
 
   function spawnRamp() {
-    rampSide = Math.random() < 0.5 ? -1 : 1;
     sideRamp.scale.x = rampSide;
     sideRamp.position.z = RAMP_SPAWN_Z;
     sideRamp.visible = true;
-    const signX = rampSide * (ROAD_HALF_WIDTH + 1.3);
-    rampSignFar.position.set(signX, 0, RAMP_SPAWN_Z + RAMP_SIGN_LEAD_FAR);
-    rampSignNear.position.set(signX, 0, RAMP_SPAWN_Z + RAMP_SIGN_LEAD_NEAR);
-    rampSignFar.visible = true;
-    rampSignNear.visible = true;
     rampActive = true;
     rampState = 'none';
   }
 
+  function clearRampCycle() {
+    rampActive = false;
+    rampCycleTravel = -1;
+    sideRamp.visible = false;
+    rampSignFar.visible = false;
+    rampSignNear.visible = false;
+  }
+
   function updateRampSpawn(delta) {
     if (!raceRunning) {
-      if (rampActive) {
-        rampActive = false;
-        sideRamp.visible = false;
-        rampSignFar.visible = false;
-        rampSignNear.visible = false;
-      }
+      clearRampCycle();
       rampState = 'none';
       rampSpawnTimer = RAMP_FIRST_DELAY;
       return;
     }
-    if (!rampActive) {
+    if (rampCycleTravel < 0) {
       rampSpawnTimer -= delta;
-      if (rampSpawnTimer <= 0) spawnRamp();
+      if (rampSpawnTimer <= 0) beginRampCycle();
       return;
     }
-    sideRamp.position.z -= travelThisFrame;
-    // Signs scroll in lockstep with the ramp — same travelThisFrame — so the
-    // lead distance set at spawn never closes.
-    rampSignFar.position.z -= travelThisFrame;
-    rampSignNear.position.z -= travelThisFrame;
+
+    // Everything already out scrolls by the same travelThisFrame, so the leads
+    // established by staggered spawns never close.
+    rampCycleTravel += travelThisFrame;
+    if (rampSignFar.visible) rampSignFar.position.z -= travelThisFrame;
+    if (rampSignNear.visible) rampSignNear.position.z -= travelThisFrame;
+    if (rampActive) sideRamp.position.z -= travelThisFrame;
+
+    // The near sign joins once the far one is the right distance ahead of it.
+    if (!rampSignNear.visible && rampCycleTravel >= RAMP_SIGN_LEAD_FAR - RAMP_SIGN_LEAD_NEAR) {
+      rampSignNear.position.z = RAMP_SPAWN_Z;
+      rampSignNear.visible = true;
+    }
+    // And the ramp last of all, a full lead behind the far sign.
+    if (!rampActive && rampCycleTravel >= RAMP_SIGN_LEAD_FAR) spawnRamp();
+
     // Gated on rampState so the mesh never disappears out from under a car
     // still riding or airborne on it — that would leave updateRamp's guard
     // clause (`if (!rampActive) return`) skipping the rest of its own state
     // machine, stranding rampState off 'none' and, with it, the traffic
     // collision and road-edge clamp it also gates. Once the player is back
     // to 'none' the mesh is already far behind the camera regardless.
-    if (rampState === 'none' && sideRamp.position.z < -(RAMP_LENGTH + 25)) {
-      rampActive = false;
-      sideRamp.visible = false;
-      rampSignFar.visible = false;
-      rampSignNear.visible = false;
+    if (rampActive && rampState === 'none' && sideRamp.position.z < -(RAMP_LENGTH + 25)) {
+      clearRampCycle();
       rampSpawnTimer = RAMP_INTERVAL_MIN + Math.random() * (RAMP_INTERVAL_MAX - RAMP_INTERVAL_MIN);
     }
   }
@@ -1892,7 +2204,9 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   // logic that ran earlier — both of which are also gated on rampState
   // elsewhere so they do not fight this.
   function updateRamp(delta) {
-    if (!rampActive) return;
+    // The flight easter egg takes over the car completely, including from a
+    // ramp that is still on screen underneath it.
+    if (!rampActive || flightState === 'flying') return;
     // Local distance along the ramp of whatever point currently sits at the
     // player's fixed z = 0, recovered from the rigid mesh's own scroll.
     const s = -sideRamp.position.z;
@@ -1937,6 +2251,76 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     }
   }
 
+  function startFlight() {
+    flightState = 'flying';
+    flightY = model.car.position.y;
+    flights += 1;
+    // The suspension's free fall handed y over; from here the flight owns it.
+    suspension.phase = 'rest';
+    suspension.velocity = 0;
+    // Back to 'none' so the ramp's own machinery — despawning the deck,
+    // scheduling the next announcement — carries on normally underneath. What
+    // keeps the road clamp and traffic collision switched off is now
+    // flightState, via carOnRoad().
+    rampState = 'none';
+    carAudio.flightStart();
+  }
+
+  function endFlight() {
+    flightState = 'none';
+    flightY = carRestY;
+    model.car.position.y = carRestY;
+    bodyPitch = 0;
+    // Land on the springs, exactly as a ramp jump does.
+    suspension.phase = 'spring';
+    suspension.springTime = 0;
+    suspension.amplitude = 0.11;
+    carAudio.flightEnd();
+  }
+
+  function updateFlight(delta) {
+    if (flightState !== 'flying') return;
+    if (!raceRunning) {
+      endFlight();
+      return;
+    }
+    const climbing = keys.has('ArrowUp') || keys.has('KeyW');
+    const diving = keys.has('ArrowDown') || keys.has('KeyS');
+    const climb = (climbing ? 1 : 0) - (diving ? 1 : 0);
+    // Screen-right is world -x from the chase camera, the same inversion the
+    // on-road steering uses.
+    const lateral = (keys.has('ArrowRight') || keys.has('KeyD') ? 1 : 0)
+      - (keys.has('ArrowLeft') || keys.has('KeyA') ? 1 : 0);
+
+    const edge = ROAD_HALF_WIDTH - CAR_HALF_WIDTH;
+    carX = THREE.MathUtils.clamp(
+      carX - lateral * FLIGHT_LATERAL_SPEED * delta, -FLIGHT_HALF_WIDTH, FLIGHT_HALF_WIDTH,
+    );
+    // Coming down out over the rocks eases the car back across the kerb on its
+    // own, slowly enough that the player's own steering always outweighs it.
+    // Without this, holding the descent off-road would simply hover at the
+    // floor below with nothing on screen saying why.
+    if (climb < 0 && Math.abs(carX) > edge) {
+      carX = THREE.MathUtils.lerp(carX, Math.sign(carX) * edge, 1 - Math.exp(-1.6 * delta));
+    }
+    // How far off the road the car is sets a floor under its altitude, so a
+    // descent converges onto the deck rather than being dragged sideways into
+    // it — clamping x by altitude instead would slide the car across the world
+    // faster than it can fly.
+    const off = Math.max(0, Math.abs(carX) - edge);
+    const floor = carRestY + (off / (FLIGHT_HALF_WIDTH - edge)) * FLIGHT_LANDING_Y;
+    flightY = THREE.MathUtils.clamp(flightY + climb * FLIGHT_CLIMB_SPEED * delta, floor, FLIGHT_CEILING);
+
+    model.car.position.x = carX;
+    model.car.position.y = flightY;
+    bodyPitch = THREE.MathUtils.lerp(bodyPitch, -climb * 0.17, 1 - Math.exp(-6 * delta));
+    model.car.rotation.x = bodyPitch;
+    model.car.rotation.z = THREE.MathUtils.lerp(model.car.rotation.z, -lateral * 0.24, 1 - Math.exp(-5 * delta));
+    model.car.rotation.y = THREE.MathUtils.lerp(model.car.rotation.y, -lateral * 0.2, 1 - Math.exp(-5 * delta));
+
+    if (flightY <= carRestY + 0.01) endFlight();
+  }
+
   let windEnvelope = 0;
   function respawnStreak(streak, seed) {
     // Streaks are seeded in a band either side of the car so they read as air
@@ -1953,6 +2337,9 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     windEnvelope = THREE.MathUtils.lerp(windEnvelope, maxed ? 1 : 0, 1 - Math.exp(-4.5 * delta));
     wind.lines.visible = windEnvelope > 0.02;
     wind.lines.material.opacity = windEnvelope * 0.85;
+    // The streaks are seeded in a band around the car's resting height, so they
+    // have to ride up with it in flight or the air would tear past underneath.
+    wind.lines.position.y = flightState === 'flying' ? model.car.position.y - carRestY : 0;
     if (!wind.lines.visible) return;
     wind.streaks.forEach((streak, index) => {
       if (streak.length === 0) respawnStreak(streak, index);
@@ -2009,6 +2396,11 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   }
 
   function updateSuspension(delta) {
+    // updateFlight owns the car's y outright; the wheels just hang at rest.
+    if (flightState === 'flying') {
+      model.wheels.forEach((wheel) => { wheel.position.y = wheelRestY; });
+      return;
+    }
     let bodyOffset = 0;
     if (suspension.phase === 'falling') {
       suspension.velocity -= 9.81 * delta;
@@ -2118,16 +2510,58 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
   // player's unavoidable collision band. Cars are staggered longitudinally so
   // the four visual lanes can converge safely as they approach the horizon.
   const SEED_BEHIND_COUNT = 4;
+  // Cars ahead are laid around a reserved corridor rather than cycling straight
+  // through LANES — four consecutive cars 10.5 units apart cover every lane
+  // inside one short stretch, which walls the road outright and would have
+  // openPassage dismantling the grid on the very first frame.
+  //
+  // Two adjacent lanes are held clear at a time: the one currently open and the
+  // one the corridor is about to move to. Reserving only the open lane is not
+  // enough, because a car blocks a 24.6-unit band of road (HIT_HALF_Z either
+  // side, plus the slice the sweep tests it against) — far longer than the
+  // 10.5 between cars — so at the seam between two runs the bands from both
+  // sides overlap and can cover every lane at once. Keeping the incoming lane
+  // clear through the whole preceding run gives the player a lane that is open
+  // on both sides of the seam to carry them across it.
+  //
+  // Six cars per run rather than four: fewer seams means fewer places for the
+  // bands to stack up. Verified by sweeping run length against spacing over
+  // hundreds of random corridors each — at four, one seed in seven still came
+  // out marginally impassable; at six, none did.
+  const SEED_OPEN_RUN = 6;
+
+  // A genuine neighbour of `lane`, never `lane` itself — clamping a random
+  // step would sit still at either kerb and collapse the two reserved lanes
+  // back into one.
+  function neighbourLane(lane) {
+    if (lane === 0) return 1;
+    if (lane === LANES.length - 1) return LANES.length - 2;
+    return lane + (Math.random() < 0.5 ? -1 : 1);
+  }
 
   function seedTraffic() {
+    let openLane = Math.floor(Math.random() * LANES.length);
+    let nextLane = neighbourLane(openLane);
     for (let i = 0; i < TRAFFIC_SEED_COUNT; i += 1) {
       const behind = i < SEED_BEHIND_COUNT;
+      const ahead = i - SEED_BEHIND_COUNT;
       const z = behind
         ? TRAFFIC_BEHIND_Z - 30 + i * 11.6
-        : 46 + (i - SEED_BEHIND_COUNT) * 10.5;
-      const lane = behind
-        ? (i % 2 ? LANES[LANES.length - 1] : LANES[0])
-        : LANES[(i - SEED_BEHIND_COUNT) % LANES.length];
+        : 46 + ahead * 10.5;
+      let lane;
+      if (behind) {
+        lane = i % 2 ? LANES[LANES.length - 1] : LANES[0];
+      } else {
+        // One lane sideways per run is a shift the player can follow: 42 units
+        // of road to cross 3.05 of lane needs 7 units/s of lateral speed,
+        // comfortably inside the 9.5 they have.
+        if (ahead > 0 && ahead % SEED_OPEN_RUN === 0) {
+          openLane = nextLane;
+          nextLane = neighbourLane(openLane);
+        }
+        const options = LANES.filter((_, index) => index !== openLane && index !== nextLane);
+        lane = options[ahead % options.length];
+      }
       spawnTrafficCar({ fromBehind: behind, forcedZ: z, forcedLane: lane });
     }
     spawnTimer = 1.5;
@@ -2232,6 +2666,73 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     return desiredSpeed;
   }
 
+  // Sends a car to whichever neighbouring lane sits further from the player's
+  // line, easing the comfort requirement only as far as it has to. Unlike the
+  // stuck-car escape in planTrafficMotion this is not about the car's own
+  // predicament — it is the road making room for the player.
+  function moveTrafficAside(slot, live) {
+    if (slot.laneChanging) return false;
+    const laneIndex = LANES.indexOf(slot.lane);
+    const options = [LANES[laneIndex - 1], LANES[laneIndex + 1]].filter((lane) => lane !== undefined);
+    for (const ease of [1, 0.6, 0.25, 0]) {
+      const candidates = options
+        .filter((lane) => Number.isFinite(laneClearance(slot, lane, live, ease)))
+        .sort((a, b) => Math.abs(b - carX) - Math.abs(a - carX));
+      if (!candidates.length) continue;
+      slot.targetLane = candidates[0];
+      slot.laneChanging = true;
+      slot.laneChangeCooldown = LANE_CHANGE_COOLDOWN + Math.random() * 1.4;
+      slot.stuckTime = 0;
+      laneChanges += 1;
+      passageOpenings += 1;
+      return true;
+    }
+    return false;
+  }
+
+  // Clears the nearest wall, one car per frame. Because passageSpans predicts
+  // where a car will be rather than where it is, a car already committed to
+  // getting out of the way stops counting immediately — so the next frame
+  // either finds the corridor open or picks a genuinely different car, and
+  // this never cascades into a synchronised shuffle.
+  function openPassage(live, delta) {
+    // Paced, so a corridor that needs two cars moved resolves over a beat
+    // rather than in one synchronised jump. A wall is a second or more of road
+    // away, which is several of these.
+    passageCooldown = Math.max(0, passageCooldown - delta);
+    if (passageCooldown > 0) return;
+    const blocked = firstWallAhead(live);
+    if (blocked < 0) return;
+    const z = PASSAGE_ACTION_MIN_Z + blocked * PASSAGE_SLICE_LENGTH;
+    const wall = live
+      .filter((slot) => Math.abs(slot.mesh.position.z - z) <= HIT_HALF_Z + PASSAGE_SLICE_LENGTH / 2)
+      // Never inside the band where traffic is close enough that moving it
+      // would read as dodging the player — that is the one thing this traffic
+      // must not do. A wall this close was already the driver's problem to
+      // steer around; the sweep's job is to stop one forming further out,
+      // where rearranging the road still looks like traffic simply flowing.
+      .filter((slot) => slot.mesh.position.z >= PASSAGE_ACTION_MIN_Z)
+      // Nearest the player's own line first: opening the gap in front of them
+      // beats opening one at the far kerb they could never reach in time.
+      .sort((a, b) => Math.abs(a.x - carX) - Math.abs(b.x - carX));
+    for (const slot of wall) {
+      // A car still sliding into the wall is cheapest to turn back — it is not
+      // committed, and nothing has taken the lane it is leaving.
+      if (slot.laneChanging && slot.targetLane !== slot.lane) {
+        slot.targetLane = slot.lane;
+        slot.laneChanging = false;
+        slot.laneChangeCooldown = LANE_CHANGE_COOLDOWN;
+        passageCooldown = PASSAGE_ACTION_INTERVAL;
+        passageOpenings += 1;
+        return;
+      }
+      if (moveTrafficAside(slot, live)) {
+        passageCooldown = PASSAGE_ACTION_INTERVAL;
+        return;
+      }
+    }
+  }
+
   function updateTraffic(delta) {
     const { slots } = raceWorld.traffic;
     if (!raceRunning) {
@@ -2242,11 +2743,15 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
       spawnTimer = 0;
       collisions = 0;
       laneChanges = 0;
+      passageOpenings = 0;
+      passageCooldown = 0;
       shotsFired = 0;
       shotHits = 0;
       coinsCollected = 0;
+      flights = 0;
       spaceAutoFireTimer = 0;
       carVX = 0;
+      if (wasRunning) resetCoins();
       wasRunning = false;
       return;
     }
@@ -2313,16 +2818,22 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
       slot.mesh.rotation.y = THREE.MathUtils.lerp(slot.mesh.rotation.y, -lateralVelocity * 0.055, 1 - Math.exp(-7 * delta));
     });
 
+    // Run after every car has planned and moved, so the sweep judges the road
+    // as it actually stands this frame. Corrections land on targetLane and take
+    // effect from the next frame — a wall is a second or more ahead, so that is
+    // nowhere near late.
+    openPassage(live, delta);
+
     // A single pass leaves residual overlap once three or more bodies pile up,
     // because separating one pair can push a car into the next. A few
     // iterations converge without needing a full physics solver.
     for (let pass = 0; pass < 24; pass += 1) if (resolveTrafficContacts(live) === 0) break;
-    // No traffic collisions while riding or airborne on the side ramp — the
-    // car isn't really sharing the traffic lanes at that point.
-    if (rampState === 'none') resolvePlayerContacts(live);
+    // No traffic collisions while riding the side ramp or flying — the car
+    // isn't really sharing the traffic lanes at that point.
+    if (carOnRoad()) resolvePlayerContacts(live);
     for (let pass = 0; pass < 24; pass += 1) if (resolveTrafficContacts(live) === 0) break;
     live.forEach((slot) => { slot.speed = Math.min(slot.speed, MAX_TRAFFIC_SPEED); });
-    if (rampState === 'none') {
+    if (carOnRoad()) {
       carX = THREE.MathUtils.clamp(carX, -(ROAD_HALF_WIDTH - CAR_HALF_WIDTH), ROAD_HALF_WIDTH - CAR_HALF_WIDTH);
       model.car.position.x = carX;
     }
@@ -2436,9 +2947,15 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
 
   function updateCameraRig(delta) {
     if (currentPreset) return;
-    camera.position.y = THREE.MathUtils.lerp(camera.position.y, cameraHeight, 1 - Math.exp(-8 * delta));
+    // The chase camera deliberately holds a fixed height rather than tracking
+    // the car — except in flight, where the car climbs far past anything a
+    // fixed rig could keep in frame. Raising the eye and the look-at target
+    // together preserves the camera's angle, so only the altitude changes.
+    const climb = flightState === 'flying' ? model.car.position.y - carRestY : 0;
+    const height = cameraHeight + climb;
+    camera.position.y = THREE.MathUtils.lerp(camera.position.y, height, 1 - Math.exp(-8 * delta));
     camera.position.z = THREE.MathUtils.lerp(camera.position.z, -cameraDistance, 1 - Math.exp(-8 * delta));
-    const targetY = cameraHeight - Math.tan(THREE.MathUtils.degToRad(cameraAngle)) * (TARGET_Z + cameraDistance);
+    const targetY = height - Math.tan(THREE.MathUtils.degToRad(cameraAngle)) * (TARGET_Z + cameraDistance);
     controls.target.y = THREE.MathUtils.lerp(controls.target.y, targetY, 1 - Math.exp(-8 * delta));
   }
 
@@ -2460,6 +2977,9 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     updateTraffic(delta);
     updateRampSpawn(delta);
     updateRamp(delta);
+    // After updateRamp, so a take-off overrides the ramp's own landing glide,
+    // and before updateCameraRig, which frames the car's final height.
+    updateFlight(delta);
     updateCoins(delta);
     updateBursts(delta);
     updateScenery();
@@ -2552,7 +3072,7 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
         && Math.abs(slot.mesh.position.x - carX) <= TRAFFIC_LANE_CLEARANCE).length,
       // How long the most-blocked active car has been unable to find a lane
       // change. Should never run away — the ease mechanism in
-      // planTrafficMotion bounds this near STUCK_DESPERATE_AFTER.
+      // planTrafficMotion bounds this near STUCK_HARD_LIMIT.
       maxStuckTime: Number(Math.max(0, ...raceWorld.traffic.slots.filter((slot) => slot.active).map((slot) => slot.stuckTime)).toFixed(1)),
       initialSeed: TRAFFIC_SEED_COUNT,
       maxActive: TRAFFIC_MAX_ACTIVE,
@@ -2571,11 +3091,18 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
     },
     coins: {
       collected: coinsCollected,
-      pool: coins.slots.length,
-      nearest: coins.slots
-        .map((slot) => ({ x: Number(slot.mesh.position.x.toFixed(2)), z: Number(slot.mesh.position.z.toFixed(1)) }))
-        .sort((a, b) => Math.abs(a.z) - Math.abs(b.z))
-        .slice(0, 3),
+      groupSize: COIN_GROUP_SIZE,
+      spacing: COIN_SPACING,
+      // Each queue reports its lane and the z of its head and tail, so the
+      // "fives down one lane, then a different lane" layout is checkable.
+      queues: coins.groups
+        .map((group) => ({
+          lane: group.lane,
+          headZ: Number(group.headZ.toFixed(1)),
+          tailZ: Number((group.headZ + COIN_QUEUE_LENGTH).toFixed(1)),
+          remaining: group.slots.filter((slot) => !slot.collected).length,
+        }))
+        .sort((a, b) => a.headZ - b.headZ),
     },
     sideRamp: {
       active: rampActive,
@@ -2585,6 +3112,40 @@ export function createNeonCarExperience(container, { onReady, onTelemetry }) {
       length: RAMP_LENGTH,
       spawnTimer: Number(rampSpawnTimer.toFixed(1)),
       launches: rampLaunches,
+      cycleTravel: Number(rampCycleTravel.toFixed(1)),
+      // Ascending z is the order the player meets them, so signs must both be
+      // below the ramp entry for the warning to arrive first.
+      reachOrder: [
+        { what: 'sign-far', z: rampSignFar.visible ? Number(rampSignFar.position.z.toFixed(1)) : null },
+        { what: 'sign-near', z: rampSignNear.visible ? Number(rampSignNear.position.z.toFixed(1)) : null },
+        { what: 'ramp-entry', z: rampActive ? Number(sideRamp.position.z.toFixed(1)) : null },
+      ],
+    },
+    // The relaxation guarantee: `blockedSlice` must stay -1. Anything else
+    // means the sweep found a wall this frame and is opening it.
+    passage: (() => {
+      const live = raceWorld.traffic.slots.filter((slot) => slot.active && !slot.launched);
+      const blocked = firstBlockedSlice(live, carX, { onRoad: carOnRoad() });
+      const wall = firstWallAhead(live);
+      return {
+        blockedSlice: blocked,
+        onRoad: carOnRoad(),
+        blockedAtZ: blocked < 0 ? null : PASSAGE_START_Z + blocked * PASSAGE_SLICE_LENGTH,
+        wallSlice: wall,
+        // Where a driver looking about a second up the road would aim.
+        aimX: aimXAt(live, 78),
+        wallAtZ: wall < 0 ? null : PASSAGE_ACTION_MIN_Z + wall * PASSAGE_SLICE_LENGTH,
+        lookaheadZ: PASSAGE_START_Z + (PASSAGE_SLICES - 1) * PASSAGE_SLICE_LENGTH,
+        openings: passageOpenings,
+      };
+    })(),
+    flight: {
+      state: flightState,
+      y: Number(model.car.position.y.toFixed(2)),
+      ceiling: FLIGHT_CEILING,
+      takeoffs: flights,
+      // The easter egg is only armed while the car is in the air off a ramp.
+      armed: rampState === 'airborne' && flightState === 'none',
     },
     render: {
       drawCalls: renderer.info.render.calls,

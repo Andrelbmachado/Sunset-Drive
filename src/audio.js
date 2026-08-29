@@ -28,7 +28,7 @@ export function createCarAudio({ musicUrl } = {}) {
   let musicVolume = 0.5;
   let sfxVolume = 0.72;
   let musicPlaying = false;
-  const events = { accelerating: 0, braking: 0, gearShift: 0, maxTurbo: 0, swerve: 0, shot: 0, launch: 0, coin: 0, ramp: 0 };
+  const events = { accelerating: 0, braking: 0, gearShift: 0, maxTurbo: 0, swerve: 0, shot: 0, launch: 0, coin: 0, ramp: 0, flight: 0 };
 
   function ensureMusic() {
     if (musicElement || !musicUrl) return musicElement;
@@ -166,6 +166,28 @@ export function createCarAudio({ musicUrl } = {}) {
     noiseBurst({ duration: 0.4, frequency: 500, sweepTo: 2200, gain: 0.05, q: 1.4 });
     lastEffect = 'ramp-jump';
     events.ramp += 1;
+  }
+
+  // Shimmering ascending arpeggio for the hidden flight mode — deliberately
+  // unlike any other cue, so stumbling on the easter egg is unmistakable.
+  function flightStart() {
+    if (!context || !enabled) return;
+    [523, 784, 1046, 1568].forEach((frequency, index) => {
+      tone({ from: frequency, to: frequency * 1.5, duration: 0.5, gain: 0.075, type: 'sine', delay: index * 0.07 });
+    });
+    noiseBurst({ duration: 0.7, frequency: 800, sweepTo: 4200, gain: 0.04, q: 1.1 });
+    lastEffect = 'flight-start';
+    events.flight += 1;
+  }
+
+  // The same arpeggio inverted: touching back down on the road.
+  function flightEnd() {
+    if (!context || !enabled) return;
+    [1568, 1046, 784, 523].forEach((frequency, index) => {
+      tone({ from: frequency, to: frequency / 1.5, duration: 0.34, gain: 0.06, type: 'sine', delay: index * 0.05 });
+    });
+    lastEffect = 'flight-end';
+    events.flight += 1;
   }
 
   // Two quick ascending tones, the classic arcade coin-pickup blip.
@@ -310,5 +332,5 @@ export function createCarAudio({ musicUrl } = {}) {
     context = null;
   }
 
-  return { setEnabled, setMusicVolume, setSfxVolume, update, swerve, shot, launchHit, coin, rampJump, getState, dispose };
+  return { setEnabled, setMusicVolume, setSfxVolume, update, swerve, shot, launchHit, coin, rampJump, flightStart, flightEnd, getState, dispose };
 }
