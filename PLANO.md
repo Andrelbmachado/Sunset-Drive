@@ -12,12 +12,13 @@ Cada item tem um **pronto quando** verificável. Fases são feitas em ordem; den
 - `render_game_to_text` expõe o estado do jogo para inspeção automatizada.
 
 ## Fase 1 — Base sólida
-- [ ] **CI em PR.** Novo `.github/workflows/ci.yml` em `pull_request`: `npm ci`, `npm run build`, `npm run test:sites`, e checar que existem `dist/client/index.html`, `dist/server/index.js` e `dist/.openai/hosting.json`.
-  *Pronto quando:* um PR mostra o check verde e um PR com build quebrado mostra vermelho.
-- [ ] **Teste de fumaça headless.** Script `tests/smoke.mjs` (Playwright) que sobe `npm run preview`, clica em `#race-start`, segura ↑ por 10 s e falha se houver erro no console ou se `render_game_to_text` não mostrar velocidade > 0. Adicionar `npm run test:smoke` e incluir no CI.
-  *Pronto quando:* roda localmente e no CI em menos de 2 min.
+- [x] **CI em PR.** Novo `.github/workflows/ci.yml` em `pull_request`: `npm ci`, `npm run build`, `npm run test:sites`, e checar que existem `dist/client/index.html`, `dist/server/index.js` e `dist/.openai/hosting.json`.
+  *Pronto quando:* um PR mostra o check verde e um PR com build quebrado mostra vermelho. — `.github/workflows/ci.yml` roda em `pull_request`, `push` na `main` e `workflow_dispatch`; também executa o teste de fumaça.
+- [x] **Teste de fumaça headless.** Script `tests/smoke.mjs` (Playwright) que sobe `npm run preview`, clica em `#race-start`, segura ↑ por 10 s e falha se houver erro no console ou se `render_game_to_text` não mostrar velocidade > 0. Adicionar `npm run test:smoke` e incluir no CI.
+  *Pronto quando:* roda localmente e no CI em menos de 2 min. — `tests/smoke.test.mjs` (Playwright + Chromium) via `npm run test:smoke`; sobe o `dist/client` num servidor estático mínimo, clica em `#race-start`, segura ↑ por 10 s e falha se a velocidade não subir ou houver erro/`pageerror` no console. App expõe `window.__sunsetReady`/`window.__sunsetTelemetry` só para leitura do teste.
 - [ ] **Automatizar `tests/passage.html`.** Rodar a página no mesmo Playwright e falhar se algum caso não passar.
   *Pronto quando:* o CI quebra se um caso de passagem falhar.
+- [ ] Chrome DevTools MCP para o agente medir FPS e ler erros de WebGL. — ferramenta do agente, sem artefato de código no repositório; fica para configuração do ambiente.
 
 ## Fase 2 — Performance (meta: 60 FPS em notebook comum)
 - [ ] **Medir antes de otimizar.** Overlay de debug opcional (`?debug=1`) com FPS, draw calls e triângulos (`renderer.info`). Registrar números de referência em `progress.md`.

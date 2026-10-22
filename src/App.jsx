@@ -130,8 +130,20 @@ export function App() {
   useEffect(() => {
     if (!mountRef.current) return undefined;
     const experience = createNeonCarExperience(mountRef.current, {
-      onReady: () => setReady(true),
-      onTelemetry: setTelemetry,
+      onReady: () => {
+        setReady(true);
+        // Gancho de observabilidade para o teste de fumaça headless: expõe
+        // apenas sinais de leitura (sem afetar a jogabilidade).
+        if (typeof window !== 'undefined') {
+          window.__sunsetReady = true;
+        }
+      },
+      onTelemetry: (data) => {
+        setTelemetry(data);
+        if (typeof window !== 'undefined') {
+          window.__sunsetTelemetry = data;
+        }
+      },
     });
     experienceRef.current = experience;
     return () => {

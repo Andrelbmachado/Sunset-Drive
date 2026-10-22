@@ -52,6 +52,7 @@ npm run dev         # servidor de desenvolvimento (Vite)
 npm run build       # build de produção em dist/
 npm run preview     # serve o build localmente
 npm run test:sites  # testes do worker de hospedagem
+npm run test:smoke  # fumaça headless (precisa do build + Chromium do Playwright)
 ```
 
 Com `npm run dev` aberto, `tests/passage.html` roda os testes visuais do sistema de trânsito no navegador.
@@ -69,6 +70,8 @@ tests/      testes do worker e do trânsito
 worker/     worker de hospedagem (Sites)
 docs/       screenshots
 ```
+
+Para o teste de fumaça, rode `npm run build` antes e, na primeira vez, `npx playwright install chromium`. A CI (`.github/workflows/ci.yml`) roda build, `test:sites` e `test:smoke` em todo PR.
 
 ## Roadmap
 Nada abaixo existe ainda no código — tudo está **planejado**:
