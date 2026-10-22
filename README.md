@@ -30,7 +30,10 @@ npm install
 npm run dev        # desenvolvimento
 npm run build      # build de produção
 npm run test:sites # testes do worker
+npm run test:smoke # fumaça headless (precisa do build + Chromium do Playwright)
 ```
+
+Para o teste de fumaça, rode `npm run build` antes e, na primeira vez, `npx playwright install chromium`. A CI (`.github/workflows/ci.yml`) roda build, `test:sites` e `test:smoke` em todo PR.
 
 ## Roadmap
 - Mais desempenho (meta 60 FPS em notebook comum).
